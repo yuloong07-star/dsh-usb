@@ -1,6 +1,6 @@
 # DSH USB
 
-DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打造。双击安装包即解压即用，新机器无需安装任何环境,但安装时需耗时大于5min。
+DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打造。双击安装包即解压即用，新机器无需安装任何环境。使用安装包安装时耗时极长，可能耗时大于5min，但安装后，在400MB/s的情况下，即使首次打开也不超过5s。
 
 > **本项目基于 [DSH-Desktop](https://github.com/anywhere-labs/deepseek-harness-desktop)（deepseek-harness-desktop）开发**，在其桌面端基础上改造为便携模式：运行数据全部保存在安装包旁侧目录，不写 `%APPDATA%`、不写注册表，删文件夹即卸载。
 
