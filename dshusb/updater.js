@@ -52,13 +52,17 @@ function overlayBinPath(ctx) {
 }
 
 function overlayVersion(ctx) {
-  try { return require(path.join(overlayDir(ctx), 'node_modules', PKG, 'package.json')).version; }
-  catch { return null; }
+  try {
+    // readFileSync, not require(): require caches by path, so an in-place
+    // overlay swap would keep reporting the pre-update version.
+    return JSON.parse(fs.readFileSync(path.join(overlayDir(ctx), 'node_modules', PKG, 'package.json'), 'utf8')).version;
+  } catch { return null; }
 }
 
 function bundledVersion() {
-  try { return require(PKG + '/package.json').version; }
-  catch { return null; }
+  try {
+    return JSON.parse(fs.readFileSync(require.resolve(PKG + '/package.json'), 'utf8')).version;
+  } catch { return null; }
 }
 
 function activeVersion(ctx) { return overlayVersion(ctx) || bundledVersion(); }
