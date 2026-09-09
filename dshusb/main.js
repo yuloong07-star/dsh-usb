@@ -223,6 +223,14 @@ function childEnv() {
   }
   if (dshHome) env.DSH_HOME = dshHome;
   if (proxyModules) env.DSH_USB_PROXY_MODULES = '1';
+  // Keep agent spill/subprocess temps and npm cache on the USB, not the host.
+  try {
+    const tmpDir = path.join(userDataDir, 'temp');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    env.TMP = tmpDir;
+    env.TEMP = tmpDir;
+    env.TMPDIR = tmpDir;
+  } catch {}
   env.NO_COLOR = '1';
   return env;
 }
@@ -1212,16 +1220,21 @@ function startPreviewStaticServer() {
 
 function scheduleCacheCleanup() {
   try {
-    const dirs = ['Cache', 'Code Cache', 'GPUCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'blob_storage', 'logs', 'Network'];
-    const ps1Path = path.join(os.tmpdir(), 'dsh-usb-cleanup.ps1');
+    // Script lives on the USB userData dir so quitting never leaves files in %TEMP%.
+    const dirs = ['Cache', 'Code Cache', 'GPUCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'blob_storage', 'logs', 'Network', 'temp'];
+    const scriptDir = path.join(userDataDir, 'logs');
+    fs.mkdirSync(scriptDir, { recursive: true });
+    const ps1Path = path.join(scriptDir, 'dsh-usb-cleanup.ps1');
     const body = [
       "$target = " + JSON.stringify(userDataDir),
+      "$me = $MyInvocation.MyCommand.Path",
       "$deadline = (Get-Date).AddSeconds(60)",
       "while ((Get-Date) -lt $deadline -and (Get-Process -Name 'DSH USB' -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 500 }",
       "foreach ($d in @(" + dirs.map((d) => JSON.stringify(d)).join(',') + ")) {",
       "  Remove-Item -LiteralPath (Join-Path $target $d) -Recurse -Force -ErrorAction SilentlyContinue",
       "}",
-      "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue",
+      // A running .ps1 cannot delete itself on Windows; hand off to cmd.
+      "Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','ping -n 3 127.0.0.1 >nul & del /f /q \"' + $me + '\"' -WindowStyle Hidden",
     ].join('\r\n');
     fs.writeFileSync(ps1Path, body, 'utf8');
     const sysRoot = process.env.SystemRoot || 'C:\\Windows';

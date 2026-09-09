@@ -219,6 +219,12 @@ function Cleanup-Host {
         Write-Log "已删除宿主机临时目录: $HostTempDir"
     }
 
+    # 基目录若已空则一并删掉，避免 C:\dsh-temp-install 长期空壳残留
+    if ((Test-Path $HostTempBase) -and -not (Get-ChildItem -Path $HostTempBase -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -Path $HostTempBase -Force -ErrorAction SilentlyContinue
+        Write-Log "已删除空的宿主机临时基目录: $HostTempBase"
+    }
+
     $oldBackups = Get-ChildItem -Path $DshDataDir -Directory -Filter "deepseek-ai-old-*" -ErrorAction SilentlyContinue
     foreach ($bak in $oldBackups) {
         Remove-Item -Path $bak.FullName -Recurse -Force -ErrorAction SilentlyContinue

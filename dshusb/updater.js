@@ -105,6 +105,9 @@ function runNpm(ctx, args, { timeoutMs = 30 * 60 * 1000, logStream = null } = {}
     }
     ctx.log('update', 'npm ' + args.join(' '));
     try { fs.mkdirSync(ctx.userDataDir, { recursive: true }); } catch {}
+    let tmpDir = path.join(ctx.userDataDir, 'temp');
+    let cacheDir = path.join(ctx.userDataDir, 'npm-cache');
+    try { fs.mkdirSync(tmpDir, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true }); } catch {}
     const proc = spawn(nodeBin, [cli, ...args], {
       cwd: ctx.userDataDir,
       env: {
@@ -112,6 +115,11 @@ function runNpm(ctx, args, { timeoutMs = 30 * 60 * 1000, logStream = null } = {}
         NPM_CONFIG_UPDATE_NOTIFIER: 'false',
         NPM_CONFIG_FUND: 'false',
         NPM_CONFIG_AUDIT: 'false',
+        // Keep npm cache and extract temps on the USB drive.
+        NPM_CONFIG_CACHE: cacheDir,
+        TMP: tmpDir,
+        TEMP: tmpDir,
+        TMPDIR: tmpDir,
       },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -498,6 +506,13 @@ function cleanupTemp(ctx) {
   if (fs.existsSync(staging)) {
     if (rmQuiet(staging)) { removed++; ctx.log('update', '清理 staging: ' + staging); }
     else ctx.log('update', '清理 staging 失败: ' + staging);
+  }
+
+  // Agent spill/subprocess temps redirected onto the USB.
+  const tmp = path.join(root, 'temp');
+  if (fs.existsSync(tmp) && rmQuiet(tmp)) {
+    removed++;
+    ctx.log('update', '清理 temp/: ' + tmp);
   }
 
   // keep newest 1 of old/broken backups
