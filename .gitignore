@@ -1,0 +1,16 @@
+# build / package
+dist/
+*.7z
+*.zip
+*.exe
+!shell/assets/**
+
+# never commit runtime / user data
+dsh/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+credentials*
+.credentials*
+settings.yaml

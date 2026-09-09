@@ -32,8 +32,20 @@ DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打�
 
 ## 版本说明
 
+- **v1.2.0**：壳源码开源入库（`shell/` + `scripts/`）；配套维护脚本与内置插件源码一并公开
 - **v1.1.0**：修复「检查 dsh 更新」崩溃（updater.js 语法错误），补齐内置 npm 运行时，更新检查与安装功能恢复可用
 - **v1.0.0**：首个便携版发布
+
+## 源码结构
+
+发行物在 [Releases](https://github.com/yuloong07-star/dsh-usb/releases)；仓库内是 Electron 壳源码与维护脚本：
+
+```
+shell/     # Electron 主进程（部署到 resources/app）
+scripts/   # update-dsh.ps1、侧栏按钮脚本、运维笔记
+```
+
+详见 [shell/README.md](shell/README.md)。
 
 ## 免责声明
 
