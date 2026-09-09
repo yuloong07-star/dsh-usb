@@ -42,6 +42,16 @@ $ErrorActionPreference = 'Stop'
 
 # 默认根目录 = 本脚本所在目录
 if (-not $Root) { $Root = $PSScriptRoot }
+# 与 update-dsh.ps1 一致：从脚本目录向上找到含 DSH USB.exe 的根
+if (-not $Root -or -not (Test-Path (Join-Path $Root 'DSH USB.exe'))) {
+    $walk = $PSScriptRoot
+    while ($walk) {
+        if (Test-Path (Join-Path $walk 'DSH USB.exe')) { $Root = $walk; break }
+        $parent = Split-Path -Parent $walk
+        if ($parent -eq $walk) { break }
+        $walk = $parent
+    }
+}
 $DshHome = Join-Path $Root 'dshusb\.dsh'
 if (-not (Test-Path $DshHome)) {
     # 旧布局回退

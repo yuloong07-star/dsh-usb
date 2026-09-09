@@ -360,9 +360,11 @@ function Atomic-Swap {
         Rename-Item -Path $AgentDir -NewName (Split-Path $backupDir -Leaf) -Force
     }
 
-    Write-Log "交换: $StagingDir → $AgentDir"
+    Write-Log "交换: $StagingDir → deepseek-ai"
     Rename-Item -Path $StagingDir -NewName "deepseek-ai" -Force
 
+    # 交换后 overlay 一定是新命名；写回脚本作用域供后续步骤使用
+    $script:AgentDir = Join-Path $DshDataDir "deepseek-ai"
     if (Test-Path $AgentDir) {
         $agentPkg = Join-Path $AgentDir "node_modules\@deepseek-ai\dsh\package.json"
         if (Test-Path $agentPkg) {
@@ -372,7 +374,7 @@ function Atomic-Swap {
             Write-Ok "交换成功（版本信息未知）"
         }
     } else {
-        throw "交换失败"
+        throw "交换失败：$AgentDir 不存在"
     }
 
     $settings = @{}

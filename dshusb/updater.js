@@ -165,8 +165,8 @@ async function checkLatest(ctx) {
 }
 
 // --- exFAT / optional-deps boot patch --------------------------------------
-// Hardened: multiple anchors per step, already-patched short-circuit,
-// per-step status logging, node --check after write.
+// Hardened: multi-anchor matching (exact + looser fallbacks), already-patched
+// short-circuit, per-step status logging, ESM-aware node --check after write.
 
 function normalizeEol(text) {
   return text.replace(/\r\n/g, '\n');
@@ -233,17 +233,28 @@ function patchBootForExfat(ctx, bootFile) {
   }
 
   // 2) include optionalDependencies in managed package list
-  const optionalOld = 'return [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.peerDependencies ?? {})];';
+  const optionalCandidates = [
+    'return [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.peerDependencies ?? {})];',
+    'return [...Object.keys(manifest.dependencies ?? {}),...Object.keys(manifest.peerDependencies ?? {})];',
+    'return [...Object.keys(manifest.dependencies || {}), ...Object.keys(manifest.peerDependencies || {})];',
+  ];
   const optionalNew = 'return [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.peerDependencies ?? {}), ...Object.keys(manifest.optionalDependencies ?? {})];';
   if (content.includes('...Object.keys(manifest.optionalDependencies ?? {})')) {
     steps.push({ name: 'optional-deps', status: 'already' });
   } else {
-    const r2 = replaceFirst(content, [optionalOld], optionalNew);
+    const r2 = replaceFirst(content, optionalCandidates, optionalNew);
     if (!r2.hit) {
-      throw new Error('exFAT 补丁步骤 optional-deps 失败：锚点未找到（上游格式可能已变化）');
+      const loose = content.match(/return\s*\[\.\.\.Object\.keys\(manifest\.dependencies\s*\?\?\s*\{\}\)\s*,\s*\.\.\.Object\.keys\(manifest\.peerDependencies\s*\?\?\s*\{\}\)\]/);
+      if (loose) {
+        content = content.replace(loose[0], optionalNew);
+        steps.push({ name: 'optional-deps', status: 'applied', via: 'loose' });
+      } else {
+        throw new Error('exFAT 补丁步骤 optional-deps 失败：锚点未找到（上游格式可能已变化）');
+      }
+    } else {
+      content = r2.text;
+      steps.push({ name: 'optional-deps', status: 'applied' });
     }
-    content = r2.text;
-    steps.push({ name: 'optional-deps', status: 'applied' });
   }
 
   // 3) insert dshCopyCurrent helper before ensureSymlink doc anchor
@@ -298,7 +309,10 @@ function patchBootForExfat(ctx, bootFile) {
   }
 
   // 5) symlink current-check also accepts a valid copy directory
-  const currentOld = 'if (entry.kind === "symlink") return stat.isSymbolicLink() && readlinkSync(link) === entry.packageDir;';
+  const currentCandidates = [
+    'if (entry.kind === "symlink") return stat.isSymbolicLink() && readlinkSync(link) === entry.packageDir;',
+    'if (entry.kind === "symlink") {\n\t\t\treturn stat.isSymbolicLink() && readlinkSync(link) === entry.packageDir;\n\t\t}',
+  ];
   const currentNew =
     'if (entry.kind === "symlink") {\n' +
     '\t\t\tif (stat.isSymbolicLink()) return readlinkSync(link) === entry.packageDir;\n' +
@@ -308,16 +322,26 @@ function patchBootForExfat(ctx, bootFile) {
   if (content.includes('if (stat.isDirectory()) return dshCopyCurrent(link, entry.packageDir);')) {
     steps.push({ name: 'current-check', status: 'already' });
   } else {
-    const r5 = replaceFirst(content, [currentOld], currentNew);
+    const r5 = replaceFirst(content, currentCandidates, currentNew);
     if (!r5.hit) {
-      throw new Error('exFAT 补丁步骤 current-check 失败：symlink current 锚点未找到');
+      const loose = content.match(/if\s*\(entry\.kind\s*===\s*"symlink"\)\s*return\s*stat\.isSymbolicLink\(\)\s*&&\s*readlinkSync\(link\)\s*===\s*entry\.packageDir;/);
+      if (loose) {
+        content = content.replace(loose[0], currentNew);
+        steps.push({ name: 'current-check', status: 'applied', via: 'loose' });
+      } else {
+        throw new Error('exFAT 补丁步骤 current-check 失败：symlink current 锚点未找到');
+      }
+    } else {
+      content = r5.text;
+      steps.push({ name: 'current-check', status: 'applied' });
     }
-    content = r5.text;
-    steps.push({ name: 'current-check', status: 'applied' });
   }
 
   // 6) symlink catch path: junction unsupported → copy package
-  const catchOld = 'if (error.code !== "EEXIST" || !lstatSync(link).isSymbolicLink() || !symlinkPointsTo(link, target)) throw error;';
+  const catchCandidates = [
+    'if (error.code !== "EEXIST" || !lstatSync(link).isSymbolicLink() || !symlinkPointsTo(link, target)) throw error;',
+    'if (error.code !== "EEXIST" || !lstatSync(link).isSymbolicLink() || !symlinkPointsTo(link, target))\n\t\tthrow error;',
+  ];
   const catchNew =
     'if (error.code === "EEXIST" && lstatSync(link).isSymbolicLink() && symlinkPointsTo(link, target)) return;\n' +
     '\t\t// DSH USB: junctions unsupported here (exFAT/FAT32) -> copy package\n' +
@@ -337,12 +361,19 @@ function patchBootForExfat(ctx, bootFile) {
   if (content.includes('junctions unsupported here (exFAT/FAT32)')) {
     steps.push({ name: 'catch-copy', status: 'already' });
   } else {
-    const r6 = replaceFirst(content, [catchOld], catchNew);
+    const r6 = replaceFirst(content, catchCandidates, catchNew);
     if (!r6.hit) {
-      throw new Error('exFAT 补丁步骤 catch-copy 失败：ensureSymlink catch 锚点未找到');
+      const loose = content.match(/if\s*\(error\.code\s*!==\s*"EEXIST"\s*\|\|\s*!lstatSync\(link\)\.isSymbolicLink\(\)\s*\|\|\s*!symlinkPointsTo\(link,\s*target\)\)\s*throw\s*error;/);
+      if (loose) {
+        content = content.replace(loose[0], catchNew);
+        steps.push({ name: 'catch-copy', status: 'applied', via: 'loose' });
+      } else {
+        throw new Error('exFAT 补丁步骤 catch-copy 失败：ensureSymlink catch 锚点未找到');
+      }
+    } else {
+      content = r6.text;
+      steps.push({ name: 'catch-copy', status: 'applied' });
     }
-    content = r6.text;
-    steps.push({ name: 'catch-copy', status: 'applied' });
   }
 
   if (!bootPatchMarkersPresent(content)) {
@@ -355,7 +386,17 @@ function patchBootForExfat(ctx, bootFile) {
     fs.writeFileSync(bootFile, content, 'utf8');
     const nodeBin = ctx.nodeExe && ctx.nodeExe();
     const checker = (nodeBin && fs.existsSync(nodeBin)) ? nodeBin : process.execPath;
-    const check = spawnSync(checker, ['--check', bootFile], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+    let check = spawnSync(checker, ['--check', bootFile], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+    // ESM files may fail CJS --check ("Cannot use import statement outside a module").
+    if (check.status !== 0 && /Cannot use import statement|Unexpected token 'export'/.test(check.stderr || '')) {
+      const mjs = bootFile + '.check.mjs';
+      try {
+        fs.copyFileSync(bootFile, mjs);
+        check = spawnSync(checker, ['--check', mjs], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+      } finally {
+        try { fs.rmSync(mjs, { force: true }); } catch {}
+      }
+    }
     if (check.status !== 0) {
       try { fs.writeFileSync(bootFile, original, 'utf8'); } catch {}
       const checkErr = (check.stderr || check.stdout || '').slice(-400);

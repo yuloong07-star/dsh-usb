@@ -70,12 +70,61 @@ function isUnderFileRoots(p) {
 const IS_WIN = process.platform === 'win32';
 
 // DSH USB: redirect userData at module load time (before Chromium init) so
-// nothing is ever written to %APPDATA%. boot() repeats this idempotently.
+// nothing is ever written to %APPDATA%. Migrate the legacy layout FIRST so an
+// empty dshusb/ (created by a previous crashed start) cannot block rename.
+function isEmptyDataRoot(dir) {
+  try {
+    const ignore = new Set(['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+    return fs.readdirSync(dir).every((n) => ignore.has(n));
+  } catch { return false; }
+}
+
+function renameQuiet(from, to, tag) {
+  try {
+    if (!fs.existsSync(from) || fs.existsSync(to)) return false;
+    fs.renameSync(from, to);
+    try { log('boot', `迁移 ${tag}: ${from} → ${to}`); } catch {}
+    return true;
+  } catch (err) {
+    try { log('boot', `迁移 ${tag} 失败: ${err.message}`); } catch {}
+    return false;
+  }
+}
+
+function migrateLegacyLayout(exeDir) {
+  try {
+    const oldRoot = path.join(exeDir, 'dsh');
+    const newRoot = path.join(exeDir, 'dshusb');
+    if (fs.existsSync(oldRoot)) {
+      if (!fs.existsSync(newRoot)) {
+        renameQuiet(oldRoot, newRoot, 'userData 根目录');
+      } else if (isEmptyDataRoot(newRoot)) {
+        try {
+          fs.rmSync(newRoot, { recursive: true, force: true });
+          renameQuiet(oldRoot, newRoot, 'userData 根目录（空的新目录已替换）');
+        } catch (err) {
+          try { log('boot', '替换空 dshusb 失败: ' + err.message); } catch {}
+        }
+      } else {
+        try { log('boot', `旧目录 ${oldRoot} 与新目录并存，保留 ${newRoot}，旧目录未合并`); } catch {}
+      }
+    }
+    const root = fs.existsSync(newRoot) ? newRoot : null;
+    if (!root) return;
+    renameQuiet(path.join(root, 'agent'), path.join(root, 'deepseek-ai'), 'agent overlay');
+    renameQuiet(path.join(root, 'dsh-home'), path.join(root, '.dsh'), 'DSH_HOME');
+  } catch (err) {
+    try { log('boot', '布局迁移失败: ' + err.message); } catch {}
+  }
+}
+
 try {
   if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
     app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
   } else {
-    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath), 'dshusb'));
+    const exeDirEarly = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
+    try { migrateLegacyLayout(exeDirEarly); } catch {}
+    app.setPath('userData', path.join(exeDirEarly, 'dshusb'));
   }
 } catch {}
 const APP_VERSION = '1.3.0';
@@ -1120,36 +1169,7 @@ function scheduleCacheCleanup() {
     log('quit', 'schedule cache cleanup failed: ' + err.message);
   }
 }
-// Migrate pre-1.3 layout: dsh/ → dshusb/, agent/ → deepseek-ai/, dsh-home/ → .dsh/
-function renameQuiet(from, to, tag) {
-  try {
-    if (!fs.existsSync(from) || fs.existsSync(to)) return false;
-    fs.renameSync(from, to);
-    log('boot', `迁移 ${tag}: ${from} → ${to}`);
-    return true;
-  } catch (err) {
-    log('boot', `迁移 ${tag} 失败: ${err.message}`);
-    return false;
-  }
-}
-
-function migrateLegacyLayout(exeDir) {
-  try {
-    const oldRoot = path.join(exeDir, 'dsh');
-    const newRoot = path.join(exeDir, 'dshusb');
-    if (fs.existsSync(oldRoot) && !fs.existsSync(newRoot)) {
-      renameQuiet(oldRoot, newRoot, 'userData 根目录');
-    } else if (fs.existsSync(oldRoot) && fs.existsSync(newRoot)) {
-      log('boot', `旧目录 ${oldRoot} 与新目录并存，保留 ${newRoot}，旧目录未合并`);
-    }
-    const root = fs.existsSync(newRoot) ? newRoot : null;
-    if (!root) return;
-    renameQuiet(path.join(root, 'agent'), path.join(root, 'deepseek-ai'), 'agent overlay');
-    renameQuiet(path.join(root, 'dsh-home'), path.join(root, '.dsh'), 'DSH_HOME');
-  } catch (err) {
-    log('boot', '布局迁移失败: ' + err.message);
-  }
-}
+// Migrate helpers live at module top (before setPath); boot() re-runs idempotently.
 
 function boot() {
   // Portable builds keep all data next to the exe.
