@@ -623,6 +623,69 @@ function rollback(ctx) {
   return broken;
 }
 
+// --- host NTFS install path (exFAT / proxy mode) ---------------------------
+
+function findHostUpdateScript(exeDir) {
+  const candidates = [
+    path.join(exeDir, 'update-dsh.ps1'),
+    path.join(exeDir, 'scripts', 'update-dsh.ps1'),
+    path.join(path.dirname(exeDir), 'scripts', 'update-dsh.ps1'),
+  ];
+  return candidates.find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  }) || null;
+}
+
+/**
+ * Schedule a host-side agent update via update-dsh.ps1 after this process exits.
+ * Used when the USB filesystem cannot create junctions (exFAT/FAT32): npm install
+ * on that volume is unreliable, so install on the host NTFS temp dir, copy back,
+ * patch, atomic-swap, heal profiles, then relaunch.
+ *
+ * Returns the spawned script path. Caller must quit the app afterwards.
+ */
+function applyUpdateViaHost(ctx, version, exeDir) {
+  const root = exeDir || process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
+  const ps1 = findHostUpdateScript(root);
+  if (!ps1) {
+    throw new Error('未找到 update-dsh.ps1（应位于 exe 旁或 scripts/ 下），无法走宿主机安装路径。');
+  }
+  abort();
+  const logDir = path.join(ctx.userDataDir, 'logs');
+  try { fs.mkdirSync(logDir, { recursive: true }); } catch {}
+  const cmdPath = path.join(logDir, 'host-update.cmd');
+  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+  const psExe = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const selfPid = process.pid;
+  // ASCII-only cmd: wait for Electron to exit, then run the host installer.
+  const lines = [
+    '@echo off',
+    'setlocal',
+    'set "SELF=' + selfPid + '"',
+    'set "PS1=' + ps1 + '"',
+    'set "ROOT=' + root + '"',
+    'set "VER=' + version + '"',
+    ':wait',
+    'tasklist /FI "PID eq %SELF%" 2>nul | find "%SELF%" >nul',
+    'if not errorlevel 1 (',
+    '  ping -n 2 127.0.0.1 >nul',
+    '  goto wait',
+    ')',
+    '"' + psExe + '" -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Yes -Launch -Version "%VER%" -DshRoot "%ROOT%"',
+    'endlocal',
+  ];
+  fs.writeFileSync(cmdPath, lines.join('\r\n'), 'utf8');
+  const cmdExe = process.env.ComSpec || path.join(sysRoot, 'System32', 'cmd.exe');
+  const child = spawn(cmdExe, ['/d', '/c', cmdPath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  ctx.log('update', '已调度宿主机更新: ' + ps1 + ' version=' + version + ' cmd=' + cmdPath);
+  return cmdPath;
+}
+
 module.exports = {
   PKG,
   AGENT_DIR_NAME,
@@ -640,6 +703,8 @@ module.exports = {
   compareVersions,
   checkLatest,
   applyUpdate,
+  applyUpdateViaHost,
+  findHostUpdateScript,
   rollback,
   abort,
   patchBootForExfat,

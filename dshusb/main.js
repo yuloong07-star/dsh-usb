@@ -652,11 +652,17 @@ async function runUpdateFlow(manual) {
   }
   if (!manual && settings.skipVersion === latest) return;
 
+  // exFAT/proxy mode: npm install on the USB volume is unreliable — use the
+  // host NTFS installer (update-dsh.ps1) after the shell exits.
+  const hostInstall = !!proxyModules;
+
   const { response } = await showBox({
     type: 'info',
     title: '发现新版本',
     message: `官方 @deepseek-ai/dsh 发布了新版本：${latest}`,
-    detail: `当前版本：${current}\n\n是否立即更新？\n· 从 npm 官方源下载新版本及其依赖（首次约 250MB）\n· 更新期间界面保持可用，完成后重启应用生效\n· 失败会自动保留当前版本`,
+    detail: hostInstall
+      ? `当前版本：${current}\n\n当前 U 盘不支持 junction（exFAT/proxy 模式），将走宿主机安装路径：\n· 在本机 NTFS 临时目录下载并安装\n· 复制回 U 盘、打兼容补丁并原子替换\n· 完成后自动重新启动 DSH USB\n\n是否立即更新？`
+      : `当前版本：${current}\n\n是否立即更新？\n· 从 npm 官方源下载新版本及其依赖（首次约 250MB）\n· 更新期间界面保持可用，完成后重启应用生效\n· 失败会自动保留当前版本`,
     buttons: ['立即更新', '跳过此版本', '稍后'],
     defaultId: 0,
     cancelId: 2,
@@ -670,8 +676,32 @@ async function runUpdateFlow(manual) {
   if (response === 2) return;
 
   updateBusy = true;
-  const progressWin = showUpdateWindow(latest);
+  const progressWin = showUpdateWindow(latest, hostInstall ? 'host' : 'agent');
   try {
+    if (hostInstall) {
+      const cmdPath = updater.applyUpdateViaHost(ctx, latest, process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath));
+      const { response: r2 } = await showBox({
+        type: 'info',
+        title: '已调度宿主机更新',
+        message: `即将更新到 @deepseek-ai/dsh@${latest}`,
+        detail: '应用将退出，由宿主机安装脚本完成下载与替换，随后自动重新启动。\n日志：' + cmdPath,
+        buttons: ['立即退出并更新', '取消'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (r2 !== 0) {
+        try { fs.rmSync(cmdPath, { force: true }); } catch {}
+        updateBusy = false;
+        if (progressWin && !progressWin.isDestroyed()) progressWin.destroy();
+        return;
+      }
+      quitting = true;
+      forceQuit = true;
+      killTree(serverProc);
+      if (sessionWatcher) sessionWatcher.stop();
+      setTimeout(() => app.exit(0), 300);
+      return;
+    }
     await updater.applyUpdate(ctx, latest);
     const { response: r2 } = await showBox({
       type: 'info',
