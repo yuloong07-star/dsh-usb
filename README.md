@@ -10,7 +10,7 @@ DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打�
 > 
 > DSH 首次启动与插件初始化会产生较多小文件读写，低速 U 盘会明显拖慢启动与响应速度。
 
-- 文件系统：exFAT / NTFS 均可（针对不支持 junction 的 exFAT 已做依赖闭包预置降级处理）
+- 文件系统：exFAT / NTFS 均可（exFAT 自动启用 ESM proxy 模块链接，避免 junction/整包复制；每次启动 dsh 会自动 heal）
 - 系统：Windows 10/11 x64
 
 ## 特性

@@ -187,8 +187,38 @@ function bootPatchMarkersPresent(content) {
     content.includes('function dshCopyCurrent') &&
     content.includes('optionalDependencies') &&
     content.includes('.dsh-copy-ok') &&
-    content.includes('cpSync')
+    content.includes('cpSync') &&
+    content.includes('DSH_USB_PROXY_MODULES')
   );
+}
+
+function applyProxyModePatch(ctx, content, steps) {
+  if (content.includes('DSH_USB_PROXY_MODULES')) {
+    steps.push({ name: 'proxy-mode', status: 'already' });
+    return content;
+  }
+  const candidates = [
+    'function isPackagedExecutable() {\n\treturn process.pkg !== void 0;\n}',
+    'function isPackagedExecutable() {\n  return process.pkg !== void 0;\n}',
+    'function isPackagedExecutable() { return process.pkg !== void 0; }',
+  ];
+  const replacement =
+    'function isPackagedExecutable() {\n' +
+    '\t// DSH USB: exFAT/FAT32 cannot create junctions; force ESM proxy packages.\n' +
+    '\treturn process.pkg !== void 0 || process.env.DSH_USB_PROXY_MODULES === "1";\n' +
+    '}';
+  const r = replaceFirst(content, candidates, replacement);
+  if (!r.hit) {
+    const loose = content.match(/function\s+isPackagedExecutable\s*\(\s*\)\s*\{[^}]*process\.pkg[^}]*\}/);
+    if (!loose) {
+      throw new Error('exFAT 补丁步骤 proxy-mode 失败：isPackagedExecutable 锚点未找到');
+    }
+    content = content.replace(loose[0], replacement);
+    steps.push({ name: 'proxy-mode', status: 'applied', via: 'loose' });
+    return content;
+  }
+  steps.push({ name: 'proxy-mode', status: 'applied' });
+  return r.text;
 }
 
 function patchBootForExfat(ctx, bootFile) {
@@ -203,6 +233,30 @@ function patchBootForExfat(ctx, bootFile) {
     steps.push({ name: 'markers', status: 'already' });
     ctx.log('update', 'exFAT/可选依赖补丁已存在，跳过: ' + bootFile);
     return { changed: false, steps };
+  }
+
+  // Older patches may lack proxy-mode only — apply that step alone when possible.
+  if (
+    content.includes('function dshCopyCurrent') &&
+    content.includes('optionalDependencies') &&
+    content.includes('.dsh-copy-ok') &&
+    content.includes('cpSync')
+  ) {
+    content = applyProxyModePatch(ctx, content, steps);
+    if (bootPatchMarkersPresent(content) && content !== normalizeEol(original)) {
+      fs.writeFileSync(bootFile, content, 'utf8');
+      const nodeBin0 = ctx.nodeExe && ctx.nodeExe();
+      const checker0 = (nodeBin0 && fs.existsSync(nodeBin0)) ? nodeBin0 : process.execPath;
+      const chk0 = spawnSync(checker0, ['--check', bootFile], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+      if (chk0.status !== 0) {
+        try { fs.writeFileSync(bootFile, original, 'utf8'); } catch {}
+        throw new Error('proxy-mode 补丁语法校验失败，已回滚: ' + (chk0.stderr || chk0.stdout || '').slice(-300));
+      }
+      ctx.log('update', '已补齐 proxy-mode 补丁: ' + bootFile);
+      return { changed: true, steps };
+    }
+    if (bootPatchMarkersPresent(content)) return { changed: false, steps };
+    throw new Error('exFAT 补丁 proxy-mode 补齐失败: ' + bootFile);
   }
 
   // 1) extend fs import with cpSync/renameSync (tolerate either already present)
@@ -375,6 +429,8 @@ function patchBootForExfat(ctx, bootFile) {
       steps.push({ name: 'catch-copy', status: 'applied' });
     }
   }
+
+  content = applyProxyModePatch(ctx, content, steps);
 
   if (!bootPatchMarkersPresent(content)) {
     throw new Error('exFAT/可选依赖补丁校验失败（标记不完整）: ' + bootFile +

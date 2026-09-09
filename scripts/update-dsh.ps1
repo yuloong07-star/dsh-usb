@@ -594,10 +594,30 @@ if (error.code === "EEXIST" && lstatSync(link).isSymbolicLink() && symlinkPoints
         $needRewrite = $true
     }
 
+    if (-not $c.Contains('DSH_USB_PROXY_MODULES')) {
+        $oldPkg = "function isPackagedExecutable() {`n`treturn process.pkg !== void 0;`n}"
+        $newPkg = @'
+function isPackagedExecutable() {
+	// DSH USB: exFAT/FAT32 cannot create junctions; force ESM proxy packages.
+	return process.pkg !== void 0 || process.env.DSH_USB_PROXY_MODULES === "1";
+}
+'@
+        if ($c.Contains($oldPkg)) {
+            $c = $c.Replace($oldPkg, $newPkg.Replace("`r`n", "`n"))
+            $needRewrite = $true
+        } elseif ($c -match 'function\s+isPackagedExecutable\s*\(\s*\)\s*\{[^}]*process\.pkg[^}]*\}') {
+            $c = [regex]::Replace($c, 'function\s+isPackagedExecutable\s*\(\s*\)\s*\{[^}]*process\.pkg[^}]*\}', $newPkg.Replace("`r`n", "`n"))
+            $needRewrite = $true
+        } else {
+            throw "dsh-app-boot isPackagedExecutable 锚点未找到，无法打 proxy-mode 补丁"
+        }
+    }
+
     $patched = $c.Contains('function dshCopyCurrent') -and
                $c.Contains('optionalDependencies') -and
                $c.Contains('.dsh-copy-ok') -and
-               $c.Contains('cpSync')
+               $c.Contains('cpSync') -and
+               $c.Contains('DSH_USB_PROXY_MODULES')
     if (-not $patched) {
         throw "exFAT/可选依赖补丁校验失败（代码格式可能已变化）: $File"
     }
@@ -635,6 +655,22 @@ function Set-McpPathCompatibility {
     Write-Ok "MCP 路径补丁已应用"
 }
 
+function Test-JunctionSupport {
+    param([string]$Dir)
+    $target = Join-Path $Dir ".dsh-junction-target"
+    $probe  = Join-Path $Dir ".dsh-junction-probe"
+    try {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        New-Item -ItemType Junction -Path $probe -Target $target -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-ProfileHeal {
     $agentPkg = Join-Path $AgentDir "node_modules\$PackageName\package.json"
     if (-not (Test-Path -LiteralPath $agentPkg)) {
@@ -653,12 +689,23 @@ await healProfilesModuleFallback({ installAnchor: '$agentPkgPath', home: '$homeP
         Write-Warn "[DryRun] 跳过 profiles 回退副本刷新"
         return
     }
-    Write-Step "离线刷新 profiles 回退副本（首次约 1-2 分钟）"
-    & $NodeExe --input-type=module -e $script
-    if ($LASTEXITCODE -ne 0) {
-        throw "profiles 回退副本刷新失败（退出码 $LASTEXITCODE）"
+    Write-Step "离线刷新 profiles 模块链接/proxy（首次约 1-2 分钟）"
+    $useProxy = -not (Test-JunctionSupport -Dir $DshDataDir)
+    if ($useProxy) {
+        Write-Log "junction 不可用，heal 使用 ESM proxy 模式"
+        $env:DSH_USB_PROXY_MODULES = '1'
+    } else {
+        Remove-Item Env:DSH_USB_PROXY_MODULES -ErrorAction SilentlyContinue
     }
-    Write-Ok "profiles 回退副本已刷新"
+    try {
+        & $NodeExe --input-type=module -e $script
+        if ($LASTEXITCODE -ne 0) {
+            throw "profiles 刷新失败（退出码 $LASTEXITCODE）"
+        }
+    } finally {
+        Remove-Item Env:DSH_USB_PROXY_MODULES -ErrorAction SilentlyContinue
+    }
+    Write-Ok "profiles 模块链接/proxy 已刷新"
 }
 
 # ===== 主流程 ==============================================================

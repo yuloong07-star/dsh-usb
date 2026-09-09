@@ -3,14 +3,14 @@ feature: slim-update-layout
 status: delivered
 updated: 2026-09-09
 branch: feat/slim-update-layout
-commits: 36cd2c5..2e24bef
+commits: 36cd2c5..HEAD
 ---
 
 # 精简升级体系与目录布局重命名
 
 ## Report
 
-**What was built** — 移除了壳自更新，仅保留 agent 更新链路。运行时布局改为嵌套的 `dshusb/deepseek-ai` + `dshusb/.dsh`，源码目录 `shell/` 同步更名 `dshusb/`；模块加载阶段（早于 `app.setPath`）完成旧 `dsh/` 布局迁移，空的新目录可被替换。exFAT 补丁改为多锚点 + loose 回退 + ESM 感知的 `node --check`，失败回滚。启动与更新成功后自动清扫 staging、过期备份（保留最新 1）与 `updates/` 残留。壳版本 1.3.0。
+**What was built** — 移除了壳自更新，仅保留 agent 更新链路。运行时布局改为嵌套的 `dshusb/deepseek-ai` + `dshusb/.dsh`，源码目录 `shell/` 同步更名 `dshusb/`；模块加载阶段（早于 `app.setPath`）完成旧 `dsh/` 布局迁移，空的新目录可被替换。exFAT 补丁改为多锚点 + loose 回退 + ESM 感知的 `node --check`，失败回滚。启动与更新成功后自动清扫 staging、过期备份（保留最新 1）与 `updates/` 残留。exFAT 上改为 ESM proxy 模块链接（不再整包复制），启动探测 junction 并注入 `DSH_USB_PROXY_MODULES`，每次 dsh 启动自动 heal。壳版本 1.3.0。
 
 **Verification** — `node --check` main.js/updater.js/preload.js/session-watcher.js/update-preload.js 全部 PASS；`Parser::ParseFile` 对 update-dsh.ps1 与 hide-sidebar-buttons.ps1 PASS；独立 review 对 36cd2c5..a58b95a 报出迁移竞态与 PS1 交换路径 2 个 critical，修复提交 2e24bef 后复审全部 RESOLVED、无新 critical、总体 PASS。
 
@@ -92,6 +92,16 @@ commits: 36cd2c5..2e24bef
 
 壳 `version` / `APP_VERSION`：`1.2.0` → `1.3.0`。
 
+### S2.7 exFAT ESM proxy 模块模式（增补）
+
+exFAT/FAT32 无法创建 junction。原先失败后整包 `cpSync` 复制（体积大、换盘符需重拷）。改为：
+
+1. **proxy 补丁**：`isPackagedExecutable()` 在 `process.env.DSH_USB_PROXY_MODULES === '1'` 时也为真，使 `resolveModuleFallbackEntries` 产出 `kind: "proxy"`（小体积 ESM re-export 包），不再走 symlink/整包复制。补丁含多锚点 + 已补丁短路 + `node --check`；旧补丁可单独补齐 proxy-step。
+2. **启动探测**：在 userData 下探测 junction；失败则 `proxyModules=true`，子进程环境注入 `DSH_USB_PROXY_MODULES=1`。
+3. **残留清理**：proxy 模式下删除 `profiles/**/node_modules` 中「无 `dsh.moduleFallback` 的真实目录」与失效 symlink，保留合法 proxy，供 heal 重建。
+4. **每次启动 heal**：`profile-boot` 每次 dsh 启动都会调用 `healProfilesModuleFallback`（幂等；路径变化时 targets 不匹配会重建 proxy）。壳侧不重复调用。
+5. **update-dsh.ps1**：`Invoke-ProfileHeal` 同样探测 junction 并注入环境变量；`Set-AppBootCompatibility` 同步打 proxy 补丁。
+
 ## [S3] Out of Scope
 
 - 不改变 agent 更新的 npm 源、用户确认对话框、30 分钟超时逻辑。
@@ -110,4 +120,5 @@ commits: 36cd2c5..2e24bef
 - [x] T6: 实现启动清扫 + 更新成功后清扫（staging/old/broken/updates） — acceptance: 多余 old 备份启动仅保留 1 个；staging 残留被删 (covers: S2.5; depends: T3)
 - [x] T7: 同步脚本与 README 路径、版本 1.3.0 — acceptance: 脚本默认路径解析到新布局（含 legacy 回退与向上找 exe）(covers: S2.1; S2.6; depends: T2)
 - [x] T8: 语法/静态验证：`node --check` 改动 .js；PowerShell `Parser::ParseFile` — acceptance: 验证命令全部 PASS (covers: S2.1; S2.3; S2.4; S2.5; depends: T2,T3,T4,T5,T6,T7)
+- [x] T9: exFAT 改用 ESM proxy 模块：boot 补丁 + 启动探测注入 env + 清理残留 + 脚本同步 — acceptance: 对已打过 copy 补丁的真实 boot 文件可增量补 proxy 且二次调用 already；PS1 解析通过 (covers: S2.7)
 

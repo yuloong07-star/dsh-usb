@@ -148,6 +148,7 @@ let desktopLog = null;
 let tray = null;
 let forceQuit = false;
 let restartingServer = false;
+let proxyModules = false;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -221,8 +222,73 @@ function childEnv() {
     delete env[k];
   }
   if (dshHome) env.DSH_HOME = dshHome;
+  if (proxyModules) env.DSH_USB_PROXY_MODULES = '1';
   env.NO_COLOR = '1';
   return env;
+}
+
+// exFAT/FAT32 cannot create junctions; force dsh-app-boot into ESM proxy mode.
+function detectJunctionSupport(dir) {
+  const target = path.join(dir, '.dsh-junction-target');
+  const probe = path.join(dir, '.dsh-junction-probe');
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    fs.symlinkSync(target, probe, 'junction');
+    return fs.lstatSync(probe).isSymbolicLink();
+  } catch {
+    return false;
+  } finally {
+    try { fs.rmSync(probe, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function isDshProxyDir(dir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    return !!(manifest && manifest.dsh && manifest.dsh.moduleFallback);
+  } catch {
+    return false;
+  }
+}
+
+// Remove materialized copies / broken links under profiles so heal can rebuild
+// as proxies. Leaves valid symlinks (NTFS) and existing proxies alone.
+function sanitizeProfileModulesForProxy(home) {
+  const roots = [
+    path.join(home, 'profiles', 'node_modules'),
+    path.join(home, 'profiles', 'web', 'node_modules'),
+  ];
+  let removed = 0;
+  const scrub = (parent, name) => {
+    const p = path.join(parent, name);
+    let st;
+    try { st = fs.lstatSync(p); } catch { return; }
+    if (st.isSymbolicLink()) {
+      try { fs.statSync(p); } catch {
+        try { fs.unlinkSync(p); removed++; } catch {}
+      }
+      return;
+    }
+    if (!st.isDirectory()) return;
+    if (name.startsWith('@')) {
+      for (const child of fs.readdirSync(p)) scrub(p, child);
+      try { if (fs.readdirSync(p).length === 0) fs.rmdirSync(p); } catch {}
+      return;
+    }
+    if (isDshProxyDir(p)) return;
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+      removed++;
+    } catch {}
+  };
+  for (const root of roots) {
+    try {
+      if (!fs.existsSync(root)) continue;
+      for (const name of fs.readdirSync(root)) scrub(root, name);
+    } catch {}
+  }
+  return removed;
 }
 
 function showBox(opts) {
@@ -689,7 +755,7 @@ async function showAbout() {
     type: 'info',
     title: '关于 DSH USB',
     message: 'DSH USB',
-    detail: 'DeepSeek Harness 桌面客户端\n\nagent 版本：' + dshVersion() + '（' + dshVersionSource() + '）\n数据目录：' + userDataDir + '\nDSH_HOME：' + (dshHome || '（dsh 默认）') +
+    detail: 'DeepSeek Harness 桌面客户端\n\nagent 版本：' + dshVersion() + '（' + dshVersionSource() + '）\n模块模式：' + (proxyModules ? 'proxy（exFAT 兼容）' : 'symlink') + '\n数据目录：' + userDataDir + '\nDSH_HOME：' + (dshHome || '（dsh 默认）') +
       '\n\n项目仓库：\n  GitHub: ' + urls.github + '\n  Gitee:  ' + urls.gitee,
     buttons: ['复制 GitHub 地址', '复制 Gitee 地址', '确定'],
   });
@@ -1195,6 +1261,21 @@ function boot() {
   log('boot', `DSH USB ${APP_VERSION}  userData=${userDataDir}  dshHome=${dshHome || '(dsh 默认)'}  agent=${dshVersion()}(${dshVersionSource()})`);
 
   try { updater.cleanupTemp(updCtx()); } catch (err) { log('boot', '启动清扫失败: ' + err.message); }
+
+  try {
+    proxyModules = !detectJunctionSupport(userDataDir);
+    if (proxyModules) {
+      process.env.DSH_USB_PROXY_MODULES = '1';
+      const n = sanitizeProfileModulesForProxy(dshHome);
+      log('boot', `junction 不可用，启用 ESM proxy 模块（清理残留 ${n} 项）；dsh 启动时将自动 heal`);
+    } else {
+      log('boot', 'junction 可用，使用 symlink 模块链接');
+    }
+  } catch (err) {
+    log('boot', 'junction 探测失败，按 proxy 模式处理: ' + err.message);
+    proxyModules = true;
+    process.env.DSH_USB_PROXY_MODULES = '1';
+  }
 
   // 移除原生菜单栏（文件/视图/帮助），全部功能由自绘 chrome 与托盘提供。
   Menu.setApplicationMenu(null);
