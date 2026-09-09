@@ -17,7 +17,6 @@ shell/                 # Electron 主进程源码（部署时放到 resources/ap
 scripts/
   update-dsh.ps1       # 宿主机 npm install + exFAT 补丁更新 agent
   hide-sidebar-buttons.*
-  AGENTS.md            # 运维笔记（含本机路径，仅供参考）
 ```
 
 ## 与运行时布局的关系

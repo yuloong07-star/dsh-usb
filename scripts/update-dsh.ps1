@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
     DSH USB 核心 agent 检查/更新脚本
 .DESCRIPTION
-    在宿主机 (C: NTFS) 完成 npm install，然后复制到 U 盘 (E: exFAT)，
+    在宿主机 (NTFS) 完成 npm install，然后复制到 U 盘 (exFAT)，
     自动打 exFAT 补丁，原子交换到 agent overlay。
     解决 exFAT 文件系统不支持 junction 导致更新失败的问题。
     支持 -Check 纯检查模式；默认仅在有新版本时更新。
@@ -12,13 +12,21 @@
 param(
     [string]$PackageName = "@deepseek-ai/dsh",
     [string]$Version = "latest",
-    [string]$DshRoot = "E:\Mobile-AI\dsh",
+    [string]$DshRoot,
     [switch]$Force,
     [switch]$DryRun,
     [switch]$Check,
     [switch]$Yes,
     [switch]$Launch
 )
+
+if (-not $DshRoot) {
+    $parent = Split-Path -Parent $PSScriptRoot
+    if (Test-Path (Join-Path $PSScriptRoot 'DSH USB.exe')) { $DshRoot = $PSScriptRoot }
+    elseif (Test-Path (Join-Path $parent 'DSH USB.exe')) { $DshRoot = $parent }
+    else { $DshRoot = $PSScriptRoot }
+}
+
 
 # ----- 路径配置 -----------------------------------------------------------
 $DshDataDir   = Join-Path $DshRoot "dsh"

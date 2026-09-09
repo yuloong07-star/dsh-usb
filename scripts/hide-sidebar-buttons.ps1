@@ -32,7 +32,7 @@
     .\hide-sidebar-buttons.ps1
 
 .EXAMPLE
-    .\hide-sidebar-buttons.ps1 -Root E:\Mobile-AI\dsh
+    .\hide-sidebar-buttons.ps1 -Root D:\Portable\DSH-USB
 #>
 param(
     [string]$Root
@@ -44,7 +44,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $Root) { $Root = $PSScriptRoot }
 $DshHome = Join-Path $Root 'dsh\dsh-home'
 if (-not (Test-Path $DshHome)) {
-    throw "找不到 DSH_HOME：$DshHome`n请用 -Root 指定 DSH 根目录，例如：.\hide-sidebar-buttons.ps1 -Root E:\Mobile-AI\dsh"
+    throw "找不到 DSH_HOME：$DshHome`n请用 -Root 指定 DSH 根目录，例如：.\hide-sidebar-buttons.ps1 -Root D:\Portable\DSH-USB"
 }
 
 # ── sidebar.footer.action 注入：激活态/已隐藏态/历史注释态 ──
