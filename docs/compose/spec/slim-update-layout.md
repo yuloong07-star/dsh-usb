@@ -1,9 +1,9 @@
 ---
 feature: slim-update-layout
-status: designed
+status: in-progress
 updated: 2026-09-09
 branch: feat/slim-update-layout
-commits: 
+commits: 36cd2c5..f1391a3
 ---
 
 # 精简升级体系与目录布局重命名
