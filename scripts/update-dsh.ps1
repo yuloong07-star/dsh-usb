@@ -29,9 +29,17 @@ if (-not $DshRoot) {
 
 
 # ----- 路径配置 -----------------------------------------------------------
-$DshDataDir   = Join-Path $DshRoot "dsh"
-$AgentDir     = Join-Path $DshDataDir "agent"
-$StagingDir   = Join-Path $DshDataDir "agent-staging"
+$DshDataDir   = Join-Path $DshRoot "dshusb"
+if (-not (Test-Path $DshDataDir)) {
+    $legacyData = Join-Path $DshRoot "dsh"
+    if (Test-Path $legacyData) { $DshDataDir = $legacyData }
+}
+$AgentDir     = Join-Path $DshDataDir "deepseek-ai"
+if (-not (Test-Path $AgentDir)) {
+    $legacyAgent = Join-Path $DshDataDir "agent"
+    if (Test-Path $legacyAgent) { $AgentDir = $legacyAgent }
+}
+$StagingDir   = Join-Path $DshDataDir "deepseek-ai-staging"
 $HostTempBase = "C:\dsh-temp-install"
 $HostTempDir  = Join-Path $HostTempBase ("dsh-update-" + (Get-Date -Format "yyyyMMddHHmmss"))
 $NodeExe      = Join-Path $DshRoot "resources\node\node.exe"
@@ -40,7 +48,11 @@ $AppBootFile  = Join-Path $StagingDir "node_modules\@deepseek-ai\dsh-app-boot\li
 $SettingsFile = Join-Path $DshDataDir "settings.json"
 $LogDir       = Join-Path $DshDataDir "logs"
 $LogFile      = Join-Path $LogDir "update.log"
-$DshHome      = Join-Path $DshDataDir "dsh-home"
+$DshHome      = Join-Path $DshDataDir ".dsh"
+if (-not (Test-Path $DshHome)) {
+    $legacyHome = Join-Path $DshDataDir "dsh-home"
+    if (Test-Path $legacyHome) { $DshHome = $legacyHome }
+}
 $McpPatchFile = Join-Path $DshHome "profiles\web\node_modules\dsh-computer-use-win\cordis.patch.yml"
 
 # ----- 颜色输出辅助 -------------------------------------------------------
@@ -207,7 +219,7 @@ function Cleanup-Host {
         Write-Log "已删除宿主机临时目录: $HostTempDir"
     }
 
-    $oldBackups = Get-ChildItem -Path $DshDataDir -Directory -Filter "agent-old-*" -ErrorAction SilentlyContinue
+    $oldBackups = Get-ChildItem -Path $DshDataDir -Directory -Filter "deepseek-ai-old-*" -ErrorAction SilentlyContinue
     foreach ($bak in $oldBackups) {
         Remove-Item -Path $bak.FullName -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "已清理旧备份: $($bak.Name)"
@@ -343,13 +355,13 @@ function Atomic-Swap {
     if (-not (Test-Path $StagingDir)) { throw "staging 目录不存在: $StagingDir" }
 
     if (Test-Path $AgentDir) {
-        $backupDir = Join-Path $DshDataDir ("agent-old-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        $backupDir = Join-Path $DshDataDir ("deepseek-ai-old-" + (Get-Date -Format "yyyyMMddHHmmss"))
         Write-Log "备份旧 overlay → $backupDir"
         Rename-Item -Path $AgentDir -NewName (Split-Path $backupDir -Leaf) -Force
     }
 
     Write-Log "交换: $StagingDir → $AgentDir"
-    Rename-Item -Path $StagingDir -NewName "agent" -Force
+    Rename-Item -Path $StagingDir -NewName "deepseek-ai" -Force
 
     if (Test-Path $AgentDir) {
         $agentPkg = Join-Path $AgentDir "node_modules\@deepseek-ai\dsh\package.json"
@@ -466,7 +478,7 @@ function Stop-DshForUpdate {
     })
     if ($roots.Count -eq 0 -and $nodeBefore.Count -eq 0) { return $true }
     if (-not $Yes) {
-        Write-Warn "检测到 DSH USB 正在运行。更新前需要关闭它（不影响 dsh-home 数据）。"
+        Write-Warn "检测到 DSH USB 正在运行。更新前需要关闭它（不影响 .dsh 数据）。"
         $answer = Read-Host "输入 y 继续，其他键取消"
         if ($answer -notmatch '^[yY]$') {
             Write-Warn "已取消更新"
@@ -692,7 +704,7 @@ function Main {
         }
 
         if ($DryRun) {
-            Write-Warn "[DryRun] 仅演练：将安装 $target 到 C 盘临时目录并交换到 agent"
+            Write-Warn "[DryRun] 仅演练：将安装 $target 到 C 盘临时目录并交换到 deepseek-ai"
             exit 0
         }
 

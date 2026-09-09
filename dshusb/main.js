@@ -22,7 +22,6 @@ const http = require('node:http');
 const os = require('node:os');
 
 const updater = require('./updater');
-const clientUpdater = require('./client-updater');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
 const zlib = require('node:zlib');
 
@@ -35,7 +34,7 @@ const fileRootsCache = { at: 0, roots: [] };
 
 function fileRoots() {
   if (Date.now() - fileRootsCache.at < 5 * 60 * 1000) return fileRootsCache.roots;
-  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const home = dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   const roots = [];
   const walk = (dir) => {
     let entries;
@@ -54,7 +53,7 @@ function fileRoots() {
       } catch { /* 跳过损坏日志 */ }
     }
   };
-  walk(path.join(dshHome, 'sessions'));
+  walk(path.join(home, 'sessions'));
   fileRootsCache.roots = [...new Set(roots)];
   fileRootsCache.at = Date.now();
   return fileRootsCache.roots;
@@ -76,10 +75,10 @@ try {
   if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
     app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
   } else {
-    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath), 'dsh'));
+    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath), 'dshusb'));
   }
 } catch {}
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6 hours
 
 // ---------------------------------------------------------------------------
@@ -99,7 +98,6 @@ let dshHome = '';
 let desktopLog = null;
 let tray = null;
 let forceQuit = false;
-let clientUpdateBusy = false;
 let restartingServer = false;
 
 // ---------------------------------------------------------------------------
@@ -630,10 +628,9 @@ function setCloseToTray(v) {
 }
 
 function repoUrls() {
-  const repos = clientUpdater.resolveRepos();
   return {
-    github: 'https://github.com/' + repos.github,
-    gitee: 'https://gitee.com/' + repos.gitee,
+    github: 'https://github.com/yuloong07-star/dsh-usb',
+    gitee: 'https://gitee.com/yuloong07-star/dsh-usb',
   };
 }
 
@@ -697,7 +694,6 @@ function registerChromeIpc() {
       case 'open-browser': if (webUrl) shell.openExternal(webUrl); break;
       case 'open-logs': shell.openPath(logsDir); break;
       case 'check-agent-update': runUpdateFlow(true); break;
-      case 'check-client-update': runClientUpdateFlow(true); break;
       case 'toggle-notify': {
         notifyOnTurnEnd = !notifyOnTurnEnd;
         const s = updater.loadSettings(updCtx());
@@ -1023,160 +1019,6 @@ function warnTempRun() {
 }
 
 // ---------------------------------------------------------------------------
-// 客户端自更新流程（更新 DSH USB 封装本身）
-// ---------------------------------------------------------------------------
-
-async function runClientUpdateFlow(manual) {
-  if (quitting) return;
-  if (clientUpdateBusy) {
-    if (manual) await showBox({ type: 'info', title: '更新', message: '客户端更新正在进行中，请稍候。', buttons: ['确定'] });
-    return;
-  }
-  const ctx = updCtx();
-  const settings = updater.loadSettings(ctx);
-  let release;
-  try {
-    release = await clientUpdater.checkLatest(ctx, APP_VERSION);
-  } catch (err) {
-    log('client-update', '检查失败: ' + err.message);
-    if (manual) {
-      await showBox({
-        type: 'warning',
-        title: '检查客户端更新失败',
-        message: '无法连接上游发布源。',
-        detail: err.message + '\n\n可通过环境变量 DSH_DESKTOP_RELEASE_API 指定镜像 API。',
-        buttons: ['确定'],
-      });
-    }
-    return;
-  }
-  if (!release.isNewer) {
-    if (manual) {
-      await showBox({
-        type: 'info',
-        title: '检查客户端更新',
-        message: '当前已是最新版本。',
-        detail: `DSH USB v${APP_VERSION}\n上游最新：${release.version}（${release.source}）`,
-        buttons: ['确定'],
-      });
-    }
-    return;
-  }
-  if (!manual && settings.skipClientVersion === release.version) return;
-  // M7 修复：用户选过"稍后"的同版本不再每 12h 重复弹窗/重复下载。
-  if (!manual && settings.pendingClientVersion === release.version) return;
-  const notes = release.body ? '\n\n更新说明：\n' + release.body.slice(0, 800) : '';
-  const { response } = await showBox({
-    type: 'info',
-    title: '发现新版本客户端',
-    message: `DSH USB 发布了新版本：v${release.version}`,
-    detail: `当前版本：v${APP_VERSION}\n发布来源：${release.source}${notes}\n\n是否立即更新？下载后自动替换并重启应用。`,
-    buttons: ['立即更新', '跳过此版本', '稍后'],
-    defaultId: 0,
-    cancelId: 2,
-  });
-  if (response === 1) {
-    settings.skipClientVersion = release.version;
-    updater.saveSettings(ctx, settings);
-    log('client-update', '用户跳过版本 ' + release.version);
-    return;
-  }
-  if (response === 2) {
-    // M7 修复：记录"稍后"版本，周期检查不再重复打扰（新版本出现时仍会提示）。
-    settings.pendingClientVersion = release.version;
-    updater.saveSettings(ctx, settings);
-    log('client-update', '用户稍后处理版本 ' + release.version);
-    return;
-  }
-
-  clientUpdateBusy = true;
-  const progressWin = showUpdateWindow(release.version, 'client');
-  try {
-    const { filePath, size } = await clientUpdater.downloadRelease(ctx, release, {
-      onProgress: (received, total) => {
-        const pct = total > 0 ? Math.round((received * 100) / total) : -1;
-        if (progressWin && !progressWin.isDestroyed()) {
-          progressWin.webContents
-            .executeJavaScript(
-              `window.__setProgress && window.__setProgress(${pct}, ${Math.round(received / 1048576)}, ${Math.round(total / 1048576)})`
-            )
-            .catch(() => {});
-        }
-      },
-    });
-    settings.pendingClientUpdate = { version: release.version, path: filePath, source: release.source };
-    settings.skipClientVersion = null;
-    settings.pendingClientVersion = null;
-    updater.saveSettings(ctx, settings);
-    const { response: r2 } = await showBox({
-      type: 'info',
-      title: '下载完成',
-      message: `已准备好 DSH USB v${release.version}（${Math.round(size / 1048576)} MB）。`,
-      detail: '立即重启应用完成更新？\n· 重启后自动安装新版本并启动\n· 选择稍后重启：下次启动时再提示安装',
-      buttons: ['立即重启', '稍后重启'],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (r2 === 0) {
-      quitting = true;
-      forceQuit = true;
-      killTree(serverProc);
-      updater.abort();
-      if (sessionWatcher) sessionWatcher.stop();
-      clientUpdater.applyUpdate(ctx, settings.pendingClientUpdate);
-      setTimeout(() => app.exit(0), 400);
-    }
-  } catch (err) {
-    log('client-update', '更新失败: ' + err.message);
-    await showBox({
-      type: 'error',
-      title: '更新失败',
-      message: '未能完成客户端更新，仍使用当前版本。',
-      detail: err.message,
-      buttons: ['确定'],
-    });
-  } finally {
-    clientUpdateBusy = false;
-    if (progressWin && !progressWin.isDestroyed()) progressWin.destroy();
-  }
-}
-
-function offerPendingClientUpdate() {
-  const ctx = updCtx();
-  const settings = updater.loadSettings(ctx);
-  const pending = settings.pendingClientUpdate;
-  if (!pending || !pending.path) return;
-  if (!fs.existsSync(pending.path)) {
-    settings.pendingClientUpdate = null;
-    updater.saveSettings(ctx, settings);
-    return;
-  }
-  if (updater.compareVersions(pending.version, APP_VERSION) <= 0) {
-    settings.pendingClientUpdate = null;
-    updater.saveSettings(ctx, settings);
-    return;
-  }
-  showBox({
-    type: 'info',
-    title: '有待安装的客户端更新',
-    message: `已下载 DSH USB v${pending.version}，是否现在安装并重启？`,
-    detail: '安装包保存在数据目录的 updates 文件夹中。',
-    buttons: ['立即重启', '稍后'],
-    defaultId: 0,
-    cancelId: 1,
-  }).then(({ response }) => {
-    if (response !== 0) return;
-    quitting = true;
-    forceQuit = true;
-    killTree(serverProc);
-    updater.abort();
-    if (sessionWatcher) sessionWatcher.stop();
-    clientUpdater.applyUpdate(ctx, pending);
-    setTimeout(() => app.exit(0), 400);
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -1278,29 +1120,61 @@ function scheduleCacheCleanup() {
     log('quit', 'schedule cache cleanup failed: ' + err.message);
   }
 }
+// Migrate pre-1.3 layout: dsh/ → dshusb/, agent/ → deepseek-ai/, dsh-home/ → .dsh/
+function renameQuiet(from, to, tag) {
+  try {
+    if (!fs.existsSync(from) || fs.existsSync(to)) return false;
+    fs.renameSync(from, to);
+    log('boot', `迁移 ${tag}: ${from} → ${to}`);
+    return true;
+  } catch (err) {
+    log('boot', `迁移 ${tag} 失败: ${err.message}`);
+    return false;
+  }
+}
+
+function migrateLegacyLayout(exeDir) {
+  try {
+    const oldRoot = path.join(exeDir, 'dsh');
+    const newRoot = path.join(exeDir, 'dshusb');
+    if (fs.existsSync(oldRoot) && !fs.existsSync(newRoot)) {
+      renameQuiet(oldRoot, newRoot, 'userData 根目录');
+    } else if (fs.existsSync(oldRoot) && fs.existsSync(newRoot)) {
+      log('boot', `旧目录 ${oldRoot} 与新目录并存，保留 ${newRoot}，旧目录未合并`);
+    }
+    const root = fs.existsSync(newRoot) ? newRoot : null;
+    if (!root) return;
+    renameQuiet(path.join(root, 'agent'), path.join(root, 'deepseek-ai'), 'agent overlay');
+    renameQuiet(path.join(root, 'dsh-home'), path.join(root, '.dsh'), 'DSH_HOME');
+  } catch (err) {
+    log('boot', '布局迁移失败: ' + err.message);
+  }
+}
+
 function boot() {
   // Portable builds keep all data next to the exe.
   if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
     app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
   } else {
-    // DSH USB build: keep ALL runtime data in a local "dsh" folder next to
+    // DSH USB build: keep ALL runtime data in a local "dshusb" folder next to
     // the exe so nothing is written to %APPDATA% and the USB drive stays
     // fully self-contained.
     const exeDir = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
-    app.setPath('userData', path.join(exeDir, 'dsh'));
+    migrateLegacyLayout(exeDir);
+    app.setPath('userData', path.join(exeDir, 'dshusb'));
   }
 
   userDataDir = app.getPath('userData');
   logsDir = path.join(userDataDir, 'logs');
-  // DSH_HOME: respect an explicit override; otherwise let dsh use its own
-  // default (~/.dsh), so the desktop app shares config/sessions with the CLI.
-  // DSH USB build: default DSH_HOME to a local folder inside "dsh" so agent
+  // DSH_HOME: respect an explicit override; otherwise use local .dsh so agent
   // sessions/config live on the USB drive instead of ~/.dsh.
-  dshHome = process.env.DSH_HOME || path.join(userDataDir, 'dsh-home');
+  dshHome = process.env.DSH_HOME || path.join(userDataDir, '.dsh');
   fs.mkdirSync(logsDir, { recursive: true });
   if (dshHome) fs.mkdirSync(dshHome, { recursive: true });
   desktopLog = fs.createWriteStream(path.join(logsDir, 'desktop.log'), { flags: 'a' });
   log('boot', `DSH USB ${APP_VERSION}  userData=${userDataDir}  dshHome=${dshHome || '(dsh 默认)'}  agent=${dshVersion()}(${dshVersionSource()})`);
+
+  try { updater.cleanupTemp(updCtx()); } catch (err) { log('boot', '启动清扫失败: ' + err.message); }
 
   // 移除原生菜单栏（文件/视图/帮助），全部功能由自绘 chrome 与托盘提供。
   Menu.setApplicationMenu(null);
@@ -1315,7 +1189,7 @@ function boot() {
       // effective DSH_HOME (same config the CLI uses).
       const s = updater.loadSettings(updCtx());
       notifyOnTurnEnd = s.notifyOnTurnEnd !== false;
-      const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+      const home = dshHome || path.join(os.homedir(), '.dsh');
       sessionWatcher = new SessionWatcher({
         sessionsDir: path.join(home, 'sessions'),
         log,
@@ -1324,10 +1198,8 @@ function boot() {
       sessionWatcher.start();
       // maintainShortcuts(); // DSH USB: never create desktop/start-menu shortcuts on first run
       warnTempRun();
-      offerPendingClientUpdate();
 
-      // [patched] agent auto-update disabled
-      // [patched] client auto-update disabled
+      // [patched] agent auto-update disabled (manual menu only)
     })
     .catch((err) => handleBootFailure(err));
 }

@@ -3,28 +3,28 @@
 // Self-update engine for the bundled @deepseek-ai/dsh agent.
 //
 // Flow:
-//   1. checkLatest():  bundled npm runs "npm view @deepseek-ai/dsh version"
-//      (respects the user's .npmrc registry / proxy settings).
+//   1. checkLatest():  HTTPS GET registry.npmjs.org/@deepseek-ai/dsh/latest.
 //   2. User consents in a dialog ("立即更新 / 跳过此版本 / 稍后").
 //   3. applyUpdate(): installs the official new version into a STAGING dir
-//      (<userData>/agent-staging) with the bundled node + npm runtime, then
-//      atomically swaps it in as <userData>/agent. A failed update never
-//      touches the working copy.
-//   4. dshBin() in main.js prefers the overlay (<userData>/agent/...) over
-//      the bundled copy, so the new version takes effect after a restart.
+//      (<userData>/deepseek-ai-staging) with the bundled node + npm runtime,
+//      patches dsh-app-boot for exFAT/optional-deps, then atomically swaps
+//      it in as <userData>/deepseek-ai. A failed update never touches the
+//      working copy.
+//   4. dshBin() in main.js prefers the overlay (<userData>/deepseek-ai/...)
+//      over the bundled copy, so the new version takes effect after a restart.
 //   5. rollback(): if the overlay fails to boot, the user can fall back to
 //      the bundled version with one click.
-//
-// The overlay lives in the user-writable data dir, so updates work for the
-// NSIS install AND the portable build (whose unpacked resources are
-// re-created from the exe on every launch).
 
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 
 const PKG = '@deepseek-ai/dsh';
 const IS_WIN = process.platform === 'win32';
+const AGENT_DIR_NAME = 'deepseek-ai';
+const STAGING_DIR_NAME = 'deepseek-ai-staging';
+const OLD_PREFIX = 'deepseek-ai-old-';
+const BROKEN_PREFIX = 'deepseek-ai-broken-';
 
 let activeProc = null;
 
@@ -44,8 +44,8 @@ function saveSettings(ctx, s) {
 
 // --- overlay paths --------------------------------------------------------
 
-function overlayDir(ctx) { return path.join(ctx.userDataDir, 'agent'); }
-function stagingDir(ctx) { return path.join(ctx.userDataDir, 'agent-staging'); }
+function overlayDir(ctx) { return path.join(ctx.userDataDir, AGENT_DIR_NAME); }
+function stagingDir(ctx) { return path.join(ctx.userDataDir, STAGING_DIR_NAME); }
 
 function overlayBinPath(ctx) {
   return path.join(overlayDir(ctx), 'node_modules', PKG, 'lib', 'bin.js');
@@ -138,7 +138,6 @@ function runNpm(ctx, args, { timeoutMs = 30 * 60 * 1000, logStream = null } = {}
 // --- public API -----------------------------------------------------------
 
 async function checkLatest(ctx) {
-  // DSH USB: use Node.js built-in https to query npm registry directly (no npm CLI needed)
   const https = require('https');
   const url = 'https://registry.npmjs.org/' + PKG + '/latest';
   ctx.log('update', 'fetching latest version from: ' + url);
@@ -164,38 +163,97 @@ async function checkLatest(ctx) {
     });
   });
 }
-const TICK = String.fromCharCode(96);
 
-// DSH USB: after npm installs a fresh dsh agent, its dsh-app-boot must be
-// patched for exFAT copy fallback and optional native dependencies before the
-// overlay is swapped in. Without these patches the new version crashes at
-// boot (ensureSymlink / stale native binaries).
+// --- exFAT / optional-deps boot patch --------------------------------------
+// Hardened: multiple anchors per step, already-patched short-circuit,
+// per-step status logging, node --check after write.
+
+function normalizeEol(text) {
+  return text.replace(/\r\n/g, '\n');
+}
+
+function replaceFirst(text, candidates, replacement) {
+  for (const cand of candidates) {
+    const idx = text.indexOf(cand);
+    if (idx >= 0) {
+      return { text: text.slice(0, idx) + replacement + text.slice(idx + cand.length), hit: cand };
+    }
+  }
+  return { text, hit: null };
+}
+
+function bootPatchMarkersPresent(content) {
+  return (
+    content.includes('function dshCopyCurrent') &&
+    content.includes('optionalDependencies') &&
+    content.includes('.dsh-copy-ok') &&
+    content.includes('cpSync')
+  );
+}
+
 function patchBootForExfat(ctx, bootFile) {
   if (!fs.existsSync(bootFile)) {
     throw new Error('安装后未找到 dsh-app-boot: ' + bootFile);
   }
-  let content = fs.readFileSync(bootFile, 'utf8');
-  let changed = false;
+  const original = fs.readFileSync(bootFile, 'utf8');
+  let content = normalizeEol(original);
+  const steps = [];
 
-  const importOld = 'import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";';
-  const importNew = 'import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";';
-  if (content.includes(importOld)) {
-    content = content.split(importOld).join(importNew);
-    changed = true;
+  if (bootPatchMarkersPresent(content)) {
+    steps.push({ name: 'markers', status: 'already' });
+    ctx.log('update', 'exFAT/可选依赖补丁已存在，跳过: ' + bootFile);
+    return { changed: false, steps };
   }
 
+  // 1) extend fs import with cpSync/renameSync (tolerate either already present)
+  const importCandidates = [
+    'import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";',
+    'import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";',
+  ];
+  const importReplacement = 'import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";';
+  if (content.includes('cpSync') && content.includes('renameSync')) {
+    steps.push({ name: 'fs-import', status: 'already' });
+  } else {
+    const r1 = replaceFirst(content, [importCandidates[0], importCandidates[1]], importReplacement);
+    if (!r1.hit) {
+      // try a looser pattern: any "import { ... } from "node:fs";" that lacks cpSync
+      const loose = content.match(/import\s*\{[^}]+\}\s*from\s*"node:fs";/);
+      if (loose && !loose[0].includes('cpSync')) {
+        content = content.replace(loose[0], importReplacement);
+        steps.push({ name: 'fs-import', status: 'applied', via: 'loose' });
+      } else if (loose && loose[0].includes('cpSync')) {
+        steps.push({ name: 'fs-import', status: 'already' });
+      } else {
+        throw new Error('exFAT 补丁步骤 fs-import 失败：未找到 node:fs import');
+      }
+    } else {
+      content = r1.text;
+      steps.push({ name: 'fs-import', status: 'applied' });
+    }
+  }
+
+  // 2) include optionalDependencies in managed package list
   const optionalOld = 'return [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.peerDependencies ?? {})];';
   const optionalNew = 'return [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.peerDependencies ?? {}), ...Object.keys(manifest.optionalDependencies ?? {})];';
-  if (content.includes(optionalOld)) {
-    content = content.split(optionalOld).join(optionalNew);
-    changed = true;
+  if (content.includes('...Object.keys(manifest.optionalDependencies ?? {})')) {
+    steps.push({ name: 'optional-deps', status: 'already' });
+  } else {
+    const r2 = replaceFirst(content, [optionalOld], optionalNew);
+    if (!r2.hit) {
+      throw new Error('exFAT 补丁步骤 optional-deps 失败：锚点未找到（上游格式可能已变化）');
+    }
+    content = r2.text;
+    steps.push({ name: 'optional-deps', status: 'applied' });
   }
 
-  if (!content.includes('function dshCopyCurrent')) {
-    const anchor = '/** Ensure `link` is a symlink to `target`, replacing a wrong link or a dsh-managed packaged proxy. */';
-    if (!content.includes(anchor)) {
-      throw new Error('dsh-app-boot 补丁锚点未找到: ' + bootFile);
-    }
+  // 3) insert dshCopyCurrent helper before ensureSymlink doc anchor
+  if (content.includes('function dshCopyCurrent')) {
+    steps.push({ name: 'copy-helper', status: 'already' });
+  } else {
+    const anchors = [
+      '/** Ensure `link` is a symlink to `target`, replacing a wrong link or a dsh-managed packaged proxy. */',
+      '/** Ensure `link` is a symlink to `target`',
+    ];
     const helper =
       '/** Return whether a real directory is a complete DSH USB copy fallback for this target. */\n' +
       'function dshCopyCurrent(link, target) {\n' +
@@ -205,18 +263,41 @@ function patchBootForExfat(ctx, bootFile) {
       '\t\treturn false;\n' +
       '\t}\n' +
       '}\n\n';
-    content = content.split(anchor).join(helper + anchor);
-    changed = true;
+    let inserted = false;
+    for (const a of anchors) {
+      const idx = content.indexOf(a);
+      if (idx >= 0) {
+        content = content.slice(0, idx) + helper + content.slice(idx);
+        inserted = true;
+        steps.push({ name: 'copy-helper', status: 'applied' });
+        break;
+      }
+    }
+    if (!inserted) {
+      throw new Error('exFAT 补丁步骤 copy-helper 失败：ensureSymlink 锚点未找到');
+    }
   }
 
+  // 4) replace throw-on-non-symlink with copy-fallback early return
+  const TICK = String.fromCharCode(96);
   const throwBody = 'dsh: ${link} exists and is not a symlink or dsh-managed module proxy; remove it so dsh can manage the installation fallback';
-  const throwOld = 'if ((stat.isDirectory() ? readModuleProxyRecord(link) : void 0)?.dsh?.moduleFallback?.targets === void 0) throw new Error(' + TICK + throwBody + TICK + ');';
+  const throwCandidates = [
+    'if ((stat.isDirectory() ? readModuleProxyRecord(link) : void 0)?.dsh?.moduleFallback?.targets === void 0) throw new Error(' + TICK + throwBody + TICK + ');',
+    'if ((stat.isDirectory() ? readModuleProxyRecord(link) : void 0)?.dsh?.moduleFallback?.targets === undefined) throw new Error(' + TICK + throwBody + TICK + ');',
+  ];
   const throwNew = 'if (!stat.isDirectory()) throw new Error(' + TICK + throwBody + TICK + ');\n// DSH USB: exFAT/FAT32 copy fallback. A marker file whose content matches\n// this target identifies a complete copy; anything stale is rebuilt below.\nif (dshCopyCurrent(link, target)) return;';
-  if (content.includes(throwOld)) {
-    content = content.split(throwOld).join(throwNew);
-    changed = true;
+  if (content.includes('if (dshCopyCurrent(link, target)) return;')) {
+    steps.push({ name: 'throw-to-copy', status: 'already' });
+  } else {
+    const r4 = replaceFirst(content, throwCandidates, throwNew);
+    if (!r4.hit) {
+      throw new Error('exFAT 补丁步骤 throw-to-copy 失败：ensureSymlink throw 锚点未找到');
+    }
+    content = r4.text;
+    steps.push({ name: 'throw-to-copy', status: 'applied' });
   }
 
+  // 5) symlink current-check also accepts a valid copy directory
   const currentOld = 'if (entry.kind === "symlink") return stat.isSymbolicLink() && readlinkSync(link) === entry.packageDir;';
   const currentNew =
     'if (entry.kind === "symlink") {\n' +
@@ -224,11 +305,18 @@ function patchBootForExfat(ctx, bootFile) {
     '\t\t\tif (stat.isDirectory()) return dshCopyCurrent(link, entry.packageDir);\n' +
     '\t\t\treturn false;\n' +
     '\t\t}';
-  if (content.includes(currentOld)) {
-    content = content.split(currentOld).join(currentNew);
-    changed = true;
+  if (content.includes('if (stat.isDirectory()) return dshCopyCurrent(link, entry.packageDir);')) {
+    steps.push({ name: 'current-check', status: 'already' });
+  } else {
+    const r5 = replaceFirst(content, [currentOld], currentNew);
+    if (!r5.hit) {
+      throw new Error('exFAT 补丁步骤 current-check 失败：symlink current 锚点未找到');
+    }
+    content = r5.text;
+    steps.push({ name: 'current-check', status: 'applied' });
   }
 
+  // 6) symlink catch path: junction unsupported → copy package
   const catchOld = 'if (error.code !== "EEXIST" || !lstatSync(link).isSymbolicLink() || !symlinkPointsTo(link, target)) throw error;';
   const catchNew =
     'if (error.code === "EEXIST" && lstatSync(link).isSymbolicLink() && symlinkPointsTo(link, target)) return;\n' +
@@ -246,30 +334,43 @@ function patchBootForExfat(ctx, bootFile) {
     '\t\t\t}\n' +
     '\t\t}\n' +
     '\t\tthrow error;';
-  if (content.includes(catchOld)) {
-    content = content.split(catchOld).join(catchNew);
-    changed = true;
+  if (content.includes('junctions unsupported here (exFAT/FAT32)')) {
+    steps.push({ name: 'catch-copy', status: 'already' });
+  } else {
+    const r6 = replaceFirst(content, [catchOld], catchNew);
+    if (!r6.hit) {
+      throw new Error('exFAT 补丁步骤 catch-copy 失败：ensureSymlink catch 锚点未找到');
+    }
+    content = r6.text;
+    steps.push({ name: 'catch-copy', status: 'applied' });
   }
 
-  const patched =
-    content.includes('function dshCopyCurrent') &&
-    content.includes('optionalDependencies') &&
-    content.includes('.dsh-copy-ok') &&
-    content.includes('cpSync');
-  if (!patched) {
-    throw new Error('exFAT/可选依赖补丁校验失败（代码格式可能已变化）: ' + bootFile);
+  if (!bootPatchMarkersPresent(content)) {
+    throw new Error('exFAT/可选依赖补丁校验失败（标记不完整）: ' + bootFile +
+      ' steps=' + steps.map((s) => s.name + ':' + s.status).join(','));
   }
 
+  const changed = content !== normalizeEol(original);
   if (changed) {
     fs.writeFileSync(bootFile, content, 'utf8');
-    ctx.log('update', '已应用 exFAT/可选依赖兼容补丁: ' + bootFile);
+    const nodeBin = ctx.nodeExe && ctx.nodeExe();
+    const checker = (nodeBin && fs.existsSync(nodeBin)) ? nodeBin : process.execPath;
+    const check = spawnSync(checker, ['--check', bootFile], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+    if (check.status !== 0) {
+      try { fs.writeFileSync(bootFile, original, 'utf8'); } catch {}
+      const checkErr = (check.stderr || check.stdout || '').slice(-400);
+      throw new Error('exFAT 补丁写回后语法校验失败，已回滚: ' + checkErr);
+    }
+    ctx.log('update', '已应用 exFAT/可选依赖兼容补丁: ' + bootFile +
+      ' steps=' + steps.map((s) => s.name + ':' + s.status).join(','));
   } else {
-    ctx.log('update', 'exFAT/可选依赖补丁已存在，跳过: ' + bootFile);
+    ctx.log('update', 'exFAT/可选依赖补丁无变化: ' + bootFile);
   }
+  return { changed, steps };
 }
 
 function patchMcpPath(ctx) {
-  const dshHome = process.env.DSH_HOME || path.join(ctx.userDataDir, 'dsh-home');
+  const dshHome = process.env.DSH_HOME || path.join(ctx.userDataDir, '.dsh');
   const file = path.join(dshHome, 'profiles', 'web', 'node_modules', 'dsh-computer-use-win', 'cordis.patch.yml');
   if (!fs.existsSync(file)) return;
   let content = fs.readFileSync(file, 'utf8');
@@ -283,6 +384,64 @@ function patchMcpPath(ctx) {
   content = content.split(oldPath).join(newPath);
   fs.writeFileSync(file, content, 'utf8');
   ctx.log('update', '已修复 dsh-computer-use-win MCP 路径: ' + file);
+}
+
+// --- cleanup ---------------------------------------------------------------
+
+function rmQuiet(target) {
+  try { fs.rmSync(target, { recursive: true, force: true }); return true; }
+  catch { return false; }
+}
+
+function cleanupTemp(ctx) {
+  const root = ctx.userDataDir;
+  let removed = 0;
+
+  const staging = stagingDir(ctx);
+  if (fs.existsSync(staging)) {
+    if (rmQuiet(staging)) { removed++; ctx.log('update', '清理 staging: ' + staging); }
+    else ctx.log('update', '清理 staging 失败: ' + staging);
+  }
+
+  // keep newest 1 of old/broken backups
+  for (const prefix of [OLD_PREFIX, BROKEN_PREFIX]) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
+        .map((e) => {
+          const full = path.join(root, e.name);
+          let mtime = 0;
+          try { mtime = fs.statSync(full).mtimeMs; } catch {}
+          return { full, name: e.name, mtime };
+        })
+        .sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+    } catch { entries = []; }
+    for (const e of entries.slice(1)) {
+      if (rmQuiet(e.full)) { removed++; ctx.log('update', '清理旧备份: ' + e.name); }
+    }
+  }
+
+  // legacy client-update download dir
+  const updates = path.join(root, 'updates');
+  if (fs.existsSync(updates)) {
+    if (rmQuiet(updates)) { removed++; ctx.log('update', '清理 updates/ 残留'); }
+  }
+
+  // legacy names from pre-rename builds (agent-old-*, agent-broken-*, agent-staging)
+  try {
+    const legacy = fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && (
+        e.name === 'agent-staging' ||
+        e.name.startsWith('agent-old-') ||
+        e.name.startsWith('agent-broken-')
+      ));
+    for (const e of legacy) {
+      if (rmQuiet(path.join(root, e.name))) { removed++; ctx.log('update', '清理旧命名残留: ' + e.name); }
+    }
+  } catch {}
+
+  return removed;
 }
 
 async function applyUpdate(ctx, version) {
@@ -310,15 +469,13 @@ async function applyUpdate(ctx, version) {
     throw new Error('安装完成但未找到 dsh 入口文件（日志: ' + logPath + '）');
   }
 
-  // DSH USB: patch the freshly installed boot code before it can run.
+  // Patch the freshly installed boot code before it can run.
   patchBootForExfat(ctx, path.join(staging, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib', 'index.js'));
   patchMcpPath(ctx);
 
-  // Atomic swap: old overlay -> backup, staging -> overlay. The backup is
-  // deliberately kept (agent-old-<ts>) so a bad boot has a manual fallback.
-  // M4 修复：两处重命名都纳入 try，失败时回滚并清理 staging 残留。
+  // Atomic swap: old overlay -> backup, staging -> overlay.
   const overlay = overlayDir(ctx);
-  const backup = path.join(ctx.userDataDir, 'agent-old-' + Date.now());
+  const backup = path.join(ctx.userDataDir, OLD_PREFIX + Date.now());
   try {
     if (fs.existsSync(overlay)) fs.renameSync(overlay, backup);
     fs.renameSync(staging, overlay);
@@ -335,6 +492,8 @@ async function applyUpdate(ctx, version) {
     ctx.log('update', '旧版本保留在: ' + backup);
   }
 
+  try { cleanupTemp(ctx); } catch (err) { ctx.log('update', '更新后清扫失败: ' + err.message); }
+
   const settings = loadSettings(ctx);
   settings.skipVersion = null;
   saveSettings(ctx, settings);
@@ -345,16 +504,23 @@ async function applyUpdate(ctx, version) {
 function rollback(ctx) {
   const overlay = overlayDir(ctx);
   if (!fs.existsSync(overlay)) return null;
-  const broken = path.join(ctx.userDataDir, 'agent-broken-' + Date.now());
+  const broken = path.join(ctx.userDataDir, BROKEN_PREFIX + Date.now());
   fs.renameSync(overlay, broken);
+  try { cleanupTemp(ctx); } catch {}
   ctx.log('update', '已回退到内置版本（问题副本保留在 ' + broken + '）');
   return broken;
 }
 
 module.exports = {
   PKG,
+  AGENT_DIR_NAME,
+  STAGING_DIR_NAME,
+  OLD_PREFIX,
+  BROKEN_PREFIX,
   loadSettings,
   saveSettings,
+  overlayDir,
+  stagingDir,
   overlayBinPath,
   overlayVersion,
   bundledVersion,
@@ -366,4 +532,5 @@ module.exports = {
   abort,
   patchBootForExfat,
   patchMcpPath,
+  cleanupTemp,
 };

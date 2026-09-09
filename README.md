@@ -15,11 +15,12 @@ DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打�
 
 ## 特性
 
-- **解压即用**：双击安装包自动解压到当前目录 `dsh\` 文件夹并启动
+- **解压即用**：双击安装包自动解压到当前目录 `dshusb\` 文件夹并启动
 - **完全免安装**：内置 Node.js 24 运行时与 dsh 全部依赖，新机器零环境要求
-- **数据本地化**：所有运行数据（会话、设置、日志）保存在 `dsh\dsh\` 内，拔盘即走
-- **dsh 检查更新**：支持在应用内检查并安装官方 `@deepseek-ai/dsh` 新版本（内置 npm 运行时，更新数据落在盘内）
-- 外壳自身的自动更新已禁用，不联网检查外壳版本
+- **数据本地化**：所有运行数据（会话、设置、日志）保存在 `dshusb\.dsh\` 内，拔盘即走
+- **dsh 检查更新**：支持在应用内检查并安装官方 `@deepseek-ai/dsh` 新版本（内置 npm 运行时，更新数据落在盘内；旧版备份自动清理，仅保留最新 1 份）
+- 壳自身不自动更新；新版本请从 Releases 手动下载替换
+- 旧版 `dsh\` 布局首次启动自动迁移为 `dshusb\deepseek-ai` + `dshusb\.dsh`
 - 安装包单实例运行，重复双击会被拦截；完成后在当前目录生成/覆盖 `DSH USB.lnk` 启动快捷方式
 - 退出菜单支持「退出并清理缓存」
 
@@ -32,7 +33,8 @@ DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打�
 
 ## 版本说明
 
-- **v1.2.0**：壳源码开源入库（`shell/` + `scripts/`）；配套维护脚本与内置插件源码一并公开
+- **v1.3.0**：移除壳自更新；目录改为 `dshusb/deepseek-ai` + `dshusb/.dsh`；exFAT 补丁加固；更新临时文件自动清扫
+- **v1.2.0**：壳源码开源入库（`dshusb/` + `scripts/`）；配套维护脚本与内置插件源码一并公开
 - **v1.1.0**：修复「检查 dsh 更新」崩溃（updater.js 语法错误），补齐内置 npm 运行时，更新检查与安装功能恢复可用
 - **v1.0.0**：首个便携版发布
 
@@ -41,11 +43,11 @@ DeepSeek Harness（DSH）便携版，专为 U 盘 / 移动硬盘随身使用打�
 发行物在 [Releases](https://github.com/yuloong07-star/dsh-usb/releases)；仓库内是 Electron 壳源码与维护脚本：
 
 ```
-shell/     # Electron 主进程（部署到 resources/app）
+dshusb/    # Electron 主进程（部署到 resources/app）
 scripts/   # update-dsh.ps1、侧栏按钮脚本、运维笔记
 ```
 
-详见 [shell/README.md](shell/README.md)。
+详见 [dshusb/README.md](dshusb/README.md)。
 
 ## 免责声明
 

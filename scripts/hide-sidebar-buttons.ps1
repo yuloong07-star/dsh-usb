@@ -6,16 +6,16 @@
     插件更新（daily-plugin-update 等）会用新构建覆盖 web profile 的 node_modules，
     被隐藏的按钮会重新出现。本脚本用于一键再次去除：
 
-      1. 定位真实 DSH_HOME（默认 <脚本所在目录>\dsh\dsh-home，可用 -Root 覆盖）
+      1. 定位真实 DSH_HOME（默认 <脚本所在目录>\dshusb\.dsh，可用 -Root 覆盖）
       2. 对四个 client 包：
 
             dsh-automation（lib/client.js）：
               若 sidebar.footer.action 注入仍处于激活状态 →
-              ① 先备份原文件到 dsh-home\backups\sidebar-buttons-hide-<时间戳>\
+              ① 先备份原文件到 .dsh\backups\sidebar-buttons-hide-<时间戳>\
               ② 在注入调用前加 `if (false) ` 前缀，使其成为死代码（语法保持合法）
             dsh-plugin-wallpaper-engine（lib/client.js）：
               若顶部「壁纸仓库」RopeDock 挂载仍处于激活状态 →
-              ① 先备份原文件到 dsh-home\backups\sidebar-buttons-hide-<时间戳>\
+              ① 先备份原文件到 .dsh\backups\sidebar-buttons-hide-<时间戳>\
               ② 在挂载条件前加 `if (false && ` 前缀并插标记注释，使整块挂载成为死代码
             ③ 有 node 时对每个改动文件执行 node --check 校验语法
       每个目标维护候选路径列表（如 dsh-mneme 0.7.6+ 起为
@@ -25,7 +25,7 @@
 
 .NOTES
     文件：hide-sidebar-buttons.ps1（配套 hide-sidebar-buttons.cmd 可双击运行）
-    改动可逆：备份在 dsh-home\backups\ 下，手动替换回去即可恢复。
+    改动可逆：备份在 .dsh\backups\ 下，手动替换回去即可恢复。
     生效：若 DSH 正在运行，需重启应用或 Ctrl+F5 刷新浏览器。
 
 .EXAMPLE
@@ -42,7 +42,12 @@ $ErrorActionPreference = 'Stop'
 
 # 默认根目录 = 本脚本所在目录
 if (-not $Root) { $Root = $PSScriptRoot }
-$DshHome = Join-Path $Root 'dsh\dsh-home'
+$DshHome = Join-Path $Root 'dshusb\.dsh'
+if (-not (Test-Path $DshHome)) {
+    # 旧布局回退
+    $legacy = Join-Path $Root 'dsh\dsh-home'
+    if (Test-Path $legacy) { $DshHome = $legacy }
+}
 if (-not (Test-Path $DshHome)) {
     throw "找不到 DSH_HOME：$DshHome`n请用 -Root 指定 DSH 根目录，例如：.\hide-sidebar-buttons.ps1 -Root D:\Portable\DSH-USB"
 }
@@ -127,7 +132,7 @@ foreach ($t in $targets) {
         }
     }
 
-    # ① 备份（§1.5：统一放 dsh-home\backups\<主题>-<时间戳>）
+    # ① 备份（§1.5：统一放 .dsh\backups\<主题>-<时间戳>）
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
     $bkDir = Join-Path $DshHome ("backups\sidebar-buttons-hide-{0}" -f $ts)
     New-Item -ItemType Directory -Path $bkDir -Force | Out-Null
