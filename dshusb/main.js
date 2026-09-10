@@ -84,17 +84,30 @@ function renameQuiet(from, to, tag) {
     if (!fs.existsSync(from) || fs.existsSync(to)) return false;
     fs.renameSync(from, to);
     try { log('boot', `迁移 ${tag}: ${from} → ${to}`); } catch {}
+    earlyLog(`迁移 ${tag}: ${from} -> ${to}`);
     return true;
   } catch (err) {
     try { log('boot', `迁移 ${tag} 失败: ${err.message}`); } catch {}
+    earlyLog(`迁移 ${tag} 失败: ${err.message}`);
     return false;
   }
+}
+
+// Pre-desktopLog breadcrumb so exFAT rename failures are not silent.
+function earlyLog(msg) {
+  try {
+    const exeDir = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
+    const p = path.join(exeDir, 'dshusb', 'logs', 'migrate.log');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, `[${new Date().toISOString()}] ${msg}\n`, 'utf8');
+  } catch {}
 }
 
 function migrateLegacyLayout(exeDir) {
   try {
     const oldRoot = path.join(exeDir, 'dsh');
     const newRoot = path.join(exeDir, 'dshusb');
+    earlyLog(`migrate start old=${fs.existsSync(oldRoot)} new=${fs.existsSync(newRoot)}`);
     if (fs.existsSync(oldRoot)) {
       if (!fs.existsSync(newRoot)) {
         renameQuiet(oldRoot, newRoot, 'userData 根目录');
@@ -103,17 +116,33 @@ function migrateLegacyLayout(exeDir) {
           fs.rmSync(newRoot, { recursive: true, force: true });
           renameQuiet(oldRoot, newRoot, 'userData 根目录（空的新目录已替换）');
         } catch (err) {
+          earlyLog(`替换空 dshusb 失败: ${err.message}`);
           try { log('boot', '替换空 dshusb 失败: ' + err.message); } catch {}
         }
       } else {
-        try { log('boot', `旧目录 ${oldRoot} 与新目录并存，保留 ${newRoot}，旧目录未合并`); } catch {}
+        earlyLog(`旧目录与新目录并存，继续迁移缺失的子目录`);
+        try { log('boot', `旧目录 ${oldRoot} 与新目录并存，迁移缺失的 overlay/数据`); } catch {}
       }
     }
     const root = fs.existsSync(newRoot) ? newRoot : null;
     if (!root) return;
+    // Always pull missing pieces from the old root (handles "both exist").
+    const srcRoot = fs.existsSync(oldRoot) && oldRoot !== root ? oldRoot : root;
+    const pieces = [
+      ['agent', 'deepseek-ai', 'agent overlay'],
+      ['dsh-home', '.dsh', 'DSH_HOME'],
+      ['settings.json', 'settings.json', 'settings.json'],
+    ];
+    for (const [fromName, toName, tag] of pieces) {
+      const from = path.join(srcRoot, fromName);
+      const to = path.join(root, toName);
+      if (fs.existsSync(from) && !fs.existsSync(to)) renameQuiet(from, to, tag);
+    }
+    // Nested names still inside new root after a partial prior migrate.
     renameQuiet(path.join(root, 'agent'), path.join(root, 'deepseek-ai'), 'agent overlay');
     renameQuiet(path.join(root, 'dsh-home'), path.join(root, '.dsh'), 'DSH_HOME');
   } catch (err) {
+    earlyLog(`布局迁移失败: ${err.message}`);
     try { log('boot', '布局迁移失败: ' + err.message); } catch {}
   }
 }
@@ -308,7 +337,7 @@ function showBox(opts) {
 // dsh web server lifecycle
 // ---------------------------------------------------------------------------
 
-function startServer() {
+function startServer(opts = {}) {
   return new Promise((resolve, reject) => {
     // M1 修复：重入前先终结旧进程，避免孤儿 harness 同时写同一 DSH_HOME。
     if (serverProc && !serverProc.killed && !quitting) {
@@ -316,6 +345,7 @@ function startServer() {
       killTree(serverProc);
       serverProc = null;
     }
+    const useNoOpen = opts.useNoOpen !== false;
     const nodeBin = nodeExe();
     const bin = dshBin();
     if (!fs.existsSync(nodeBin)) {
@@ -324,9 +354,11 @@ function startServer() {
         (app.isPackaged ? '安装包可能不完整，请重新安装。' : '开发模式请先运行: npm run fetch-node')
       ));
     }
+    const args = ['web', '--host', '127.0.0.1', '--port', '0'];
+    if (useNoOpen) args.push('--no-open');
     const out = fs.createWriteStream(path.join(logsDir, 'dsh-web.log'), { flags: 'a' });
-    log('dsh', `启动: "${nodeBin}" "${bin}" web --host 127.0.0.1 --port 0 --no-open`);
-    const proc = spawn(nodeBin, [bin, 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'], {
+    log('dsh', `启动: "${nodeBin}" "${bin}" ${args.join(' ')}`);
+    const proc = spawn(nodeBin, [bin, ...args], {
       cwd: userDataDir,
       env: childEnv(),
       windowsHide: true,
@@ -335,6 +367,7 @@ function startServer() {
     serverProc = proc;
     let settled = false;
     let bootTimer = null;
+    let stderrBuf = '';
     const finish = (fn, value) => {
       if (!settled) { settled = true; fn(value); }
       if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
@@ -348,14 +381,19 @@ function startServer() {
       }
     };
     proc.stdout.on('data', onData);
-    proc.stderr.on('data', (c) => out.write(c));
+    proc.stderr.on('data', (c) => { out.write(c); stderrBuf += c.toString(); });
     proc.on('error', (err) => finish(reject, err));
     proc.on('exit', (code, signal) => {
       out.end();
       log('dsh', `进程退出 code=${code} signal=${signal}`);
-      // 原地重启（插件市场）或已替换为新进程时，不打扰用户、也不清掉新进程的句柄。
       const intentional = restartingServer || serverProc !== proc;
       if (serverProc === proc) serverProc = null;
+      // Old bundled agents (e.g. 0.1.0-rc.6) reject --no-open; retry once without it.
+      if (!quitting && !intentional && useNoOpen && /unknown option ['"]--no-open['"]/.test(stderrBuf)) {
+        log('dsh', '当前 agent 不支持 --no-open，去掉参数后重试');
+        startServer({ useNoOpen: false }).then(resolve, reject);
+        return;
+      }
       finish(reject, new Error(`dsh web 启动失败（退出码 ${code}）。日志: ${path.join(logsDir, 'dsh-web.log')}`));
       if (!quitting && !intentional && webUrl && mainWindow && !mainWindow.isDestroyed()) {
         showBox({
