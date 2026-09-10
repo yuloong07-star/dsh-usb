@@ -289,13 +289,11 @@ function isDshProxyDir(dir) {
   }
 }
 
-// Remove materialized copies / broken links under profiles so heal can rebuild
-// as proxies. Leaves valid symlinks (NTFS) and existing proxies alone.
+// Remove materialized copies / broken links under the SHARED module-fallback
+// dir so heal can rebuild as proxies. Never touch profiles/<profile>/node_modules
+// (user-installed plugins live there).
 function sanitizeProfileModulesForProxy(home) {
-  const roots = [
-    path.join(home, 'profiles', 'node_modules'),
-    path.join(home, 'profiles', 'web', 'node_modules'),
-  ];
+  const roots = [path.join(home, 'profiles', 'node_modules')];
   let removed = 0;
   const scrub = (parent, name) => {
     const p = path.join(parent, name);
