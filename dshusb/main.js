@@ -22,7 +22,6 @@ const http = require('node:http');
 const os = require('node:os');
 
 const updater = require('./updater');
-const clientUpdater = require('./client-updater');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
 const zlib = require('node:zlib');
 
@@ -35,7 +34,7 @@ const fileRootsCache = { at: 0, roots: [] };
 
 function fileRoots() {
   if (Date.now() - fileRootsCache.at < 5 * 60 * 1000) return fileRootsCache.roots;
-  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const home = dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   const roots = [];
   const walk = (dir) => {
     let entries;
@@ -54,7 +53,7 @@ function fileRoots() {
       } catch { /* 跳过损坏日志 */ }
     }
   };
-  walk(path.join(dshHome, 'sessions'));
+  walk(path.join(home, 'sessions'));
   fileRootsCache.roots = [...new Set(roots)];
   fileRootsCache.at = Date.now();
   return fileRootsCache.roots;
@@ -71,15 +70,93 @@ function isUnderFileRoots(p) {
 const IS_WIN = process.platform === 'win32';
 
 // DSH USB: redirect userData at module load time (before Chromium init) so
-// nothing is ever written to %APPDATA%. boot() repeats this idempotently.
+// nothing is ever written to %APPDATA%. Migrate the legacy layout FIRST so an
+// empty dshusb/ (created by a previous crashed start) cannot block rename.
+function isEmptyDataRoot(dir) {
+  try {
+    const ignore = new Set(['lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+    return fs.readdirSync(dir).every((n) => ignore.has(n));
+  } catch { return false; }
+}
+
+function renameQuiet(from, to, tag) {
+  try {
+    if (!fs.existsSync(from) || fs.existsSync(to)) return false;
+    fs.renameSync(from, to);
+    try { log('boot', `迁移 ${tag}: ${from} → ${to}`); } catch {}
+    earlyLog(`迁移 ${tag}: ${from} -> ${to}`);
+    return true;
+  } catch (err) {
+    try { log('boot', `迁移 ${tag} 失败: ${err.message}`); } catch {}
+    earlyLog(`迁移 ${tag} 失败: ${err.message}`);
+    return false;
+  }
+}
+
+// Pre-desktopLog breadcrumb so exFAT rename failures are not silent.
+function earlyLog(msg) {
+  try {
+    const exeDir = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
+    const p = path.join(exeDir, 'dshusb', 'logs', 'migrate.log');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, `[${new Date().toISOString()}] ${msg}\n`, 'utf8');
+  } catch {}
+}
+
+function migrateLegacyLayout(exeDir) {
+  try {
+    const oldRoot = path.join(exeDir, 'dsh');
+    const newRoot = path.join(exeDir, 'dshusb');
+    earlyLog(`migrate start old=${fs.existsSync(oldRoot)} new=${fs.existsSync(newRoot)}`);
+    if (fs.existsSync(oldRoot)) {
+      if (!fs.existsSync(newRoot)) {
+        renameQuiet(oldRoot, newRoot, 'userData 根目录');
+      } else if (isEmptyDataRoot(newRoot)) {
+        try {
+          fs.rmSync(newRoot, { recursive: true, force: true });
+          renameQuiet(oldRoot, newRoot, 'userData 根目录（空的新目录已替换）');
+        } catch (err) {
+          earlyLog(`替换空 dshusb 失败: ${err.message}`);
+          try { log('boot', '替换空 dshusb 失败: ' + err.message); } catch {}
+        }
+      } else {
+        earlyLog(`旧目录与新目录并存，继续迁移缺失的子目录`);
+        try { log('boot', `旧目录 ${oldRoot} 与新目录并存，迁移缺失的 overlay/数据`); } catch {}
+      }
+    }
+    const root = fs.existsSync(newRoot) ? newRoot : null;
+    if (!root) return;
+    // Always pull missing pieces from the old root (handles "both exist").
+    const srcRoot = fs.existsSync(oldRoot) && oldRoot !== root ? oldRoot : root;
+    const pieces = [
+      ['agent', 'deepseek-ai', 'agent overlay'],
+      ['dsh-home', '.dsh', 'DSH_HOME'],
+      ['settings.json', 'settings.json', 'settings.json'],
+    ];
+    for (const [fromName, toName, tag] of pieces) {
+      const from = path.join(srcRoot, fromName);
+      const to = path.join(root, toName);
+      if (fs.existsSync(from) && !fs.existsSync(to)) renameQuiet(from, to, tag);
+    }
+    // Nested names still inside new root after a partial prior migrate.
+    renameQuiet(path.join(root, 'agent'), path.join(root, 'deepseek-ai'), 'agent overlay');
+    renameQuiet(path.join(root, 'dsh-home'), path.join(root, '.dsh'), 'DSH_HOME');
+  } catch (err) {
+    earlyLog(`布局迁移失败: ${err.message}`);
+    try { log('boot', '布局迁移失败: ' + err.message); } catch {}
+  }
+}
+
 try {
   if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
     app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
   } else {
-    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath), 'dsh'));
+    const exeDirEarly = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
+    try { migrateLegacyLayout(exeDirEarly); } catch {}
+    app.setPath('userData', path.join(exeDirEarly, 'dshusb'));
   }
 } catch {}
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6 hours
 
 // ---------------------------------------------------------------------------
@@ -99,8 +176,8 @@ let dshHome = '';
 let desktopLog = null;
 let tray = null;
 let forceQuit = false;
-let clientUpdateBusy = false;
 let restartingServer = false;
+let proxyModules = false;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -174,8 +251,81 @@ function childEnv() {
     delete env[k];
   }
   if (dshHome) env.DSH_HOME = dshHome;
+  if (proxyModules) env.DSH_USB_PROXY_MODULES = '1';
+  // Keep agent spill/subprocess temps and npm cache on the USB, not the host.
+  try {
+    const tmpDir = path.join(userDataDir, 'temp');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    env.TMP = tmpDir;
+    env.TEMP = tmpDir;
+    env.TMPDIR = tmpDir;
+  } catch {}
   env.NO_COLOR = '1';
   return env;
+}
+
+// exFAT/FAT32 cannot create junctions; force dsh-app-boot into ESM proxy mode.
+function detectJunctionSupport(dir) {
+  const target = path.join(dir, '.dsh-junction-target');
+  const probe = path.join(dir, '.dsh-junction-probe');
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    fs.symlinkSync(target, probe, 'junction');
+    return fs.lstatSync(probe).isSymbolicLink();
+  } catch {
+    return false;
+  } finally {
+    try { fs.rmSync(probe, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function isDshProxyDir(dir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    return !!(manifest && manifest.dsh && manifest.dsh.moduleFallback);
+  } catch {
+    return false;
+  }
+}
+
+// Remove materialized copies / broken links under profiles so heal can rebuild
+// as proxies. Leaves valid symlinks (NTFS) and existing proxies alone.
+function sanitizeProfileModulesForProxy(home) {
+  const roots = [
+    path.join(home, 'profiles', 'node_modules'),
+    path.join(home, 'profiles', 'web', 'node_modules'),
+  ];
+  let removed = 0;
+  const scrub = (parent, name) => {
+    const p = path.join(parent, name);
+    let st;
+    try { st = fs.lstatSync(p); } catch { return; }
+    if (st.isSymbolicLink()) {
+      try { fs.statSync(p); } catch {
+        try { fs.unlinkSync(p); removed++; } catch {}
+      }
+      return;
+    }
+    if (!st.isDirectory()) return;
+    if (name.startsWith('@')) {
+      for (const child of fs.readdirSync(p)) scrub(p, child);
+      try { if (fs.readdirSync(p).length === 0) fs.rmdirSync(p); } catch {}
+      return;
+    }
+    if (isDshProxyDir(p)) return;
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+      removed++;
+    } catch {}
+  };
+  for (const root of roots) {
+    try {
+      if (!fs.existsSync(root)) continue;
+      for (const name of fs.readdirSync(root)) scrub(root, name);
+    } catch {}
+  }
+  return removed;
 }
 
 function showBox(opts) {
@@ -187,7 +337,7 @@ function showBox(opts) {
 // dsh web server lifecycle
 // ---------------------------------------------------------------------------
 
-function startServer() {
+function startServer(opts = {}) {
   return new Promise((resolve, reject) => {
     // M1 修复：重入前先终结旧进程，避免孤儿 harness 同时写同一 DSH_HOME。
     if (serverProc && !serverProc.killed && !quitting) {
@@ -195,6 +345,7 @@ function startServer() {
       killTree(serverProc);
       serverProc = null;
     }
+    const useNoOpen = opts.useNoOpen !== false;
     const nodeBin = nodeExe();
     const bin = dshBin();
     if (!fs.existsSync(nodeBin)) {
@@ -203,9 +354,11 @@ function startServer() {
         (app.isPackaged ? '安装包可能不完整，请重新安装。' : '开发模式请先运行: npm run fetch-node')
       ));
     }
+    const args = ['web', '--host', '127.0.0.1', '--port', '0'];
+    if (useNoOpen) args.push('--no-open');
     const out = fs.createWriteStream(path.join(logsDir, 'dsh-web.log'), { flags: 'a' });
-    log('dsh', `启动: "${nodeBin}" "${bin}" web --host 127.0.0.1 --port 0 --no-open`);
-    const proc = spawn(nodeBin, [bin, 'web', '--host', '127.0.0.1', '--port', '0', '--no-open'], {
+    log('dsh', `启动: "${nodeBin}" "${bin}" ${args.join(' ')}`);
+    const proc = spawn(nodeBin, [bin, ...args], {
       cwd: userDataDir,
       env: childEnv(),
       windowsHide: true,
@@ -214,6 +367,7 @@ function startServer() {
     serverProc = proc;
     let settled = false;
     let bootTimer = null;
+    let stderrBuf = '';
     const finish = (fn, value) => {
       if (!settled) { settled = true; fn(value); }
       if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
@@ -227,14 +381,19 @@ function startServer() {
       }
     };
     proc.stdout.on('data', onData);
-    proc.stderr.on('data', (c) => out.write(c));
+    proc.stderr.on('data', (c) => { out.write(c); stderrBuf += c.toString(); });
     proc.on('error', (err) => finish(reject, err));
     proc.on('exit', (code, signal) => {
       out.end();
       log('dsh', `进程退出 code=${code} signal=${signal}`);
-      // 原地重启（插件市场）或已替换为新进程时，不打扰用户、也不清掉新进程的句柄。
       const intentional = restartingServer || serverProc !== proc;
       if (serverProc === proc) serverProc = null;
+      // Old bundled agents (e.g. 0.1.0-rc.6) reject --no-open; retry once without it.
+      if (!quitting && !intentional && useNoOpen && /unknown option ['"]--no-open['"]/.test(stderrBuf)) {
+        log('dsh', '当前 agent 不支持 --no-open，去掉参数后重试');
+        startServer({ useNoOpen: false }).then(resolve, reject);
+        return;
+      }
       finish(reject, new Error(`dsh web 启动失败（退出码 ${code}）。日志: ${path.join(logsDir, 'dsh-web.log')}`));
       if (!quitting && !intentional && webUrl && mainWindow && !mainWindow.isDestroyed()) {
         showBox({
@@ -531,11 +690,17 @@ async function runUpdateFlow(manual) {
   }
   if (!manual && settings.skipVersion === latest) return;
 
+  // exFAT/proxy mode: npm install on the USB volume is unreliable — use the
+  // host NTFS installer (update-dsh.ps1) after the shell exits.
+  const hostInstall = !!proxyModules;
+
   const { response } = await showBox({
     type: 'info',
     title: '发现新版本',
     message: `官方 @deepseek-ai/dsh 发布了新版本：${latest}`,
-    detail: `当前版本：${current}\n\n是否立即更新？\n· 从 npm 官方源下载新版本及其依赖（首次约 250MB）\n· 更新期间界面保持可用，完成后重启应用生效\n· 失败会自动保留当前版本`,
+    detail: hostInstall
+      ? `当前版本：${current}\n\n当前 U 盘不支持 junction（exFAT/proxy 模式），将走宿主机安装路径：\n· 在本机 NTFS 临时目录下载并安装\n· 复制回 U 盘、打兼容补丁并原子替换\n· 完成后自动重新启动 DSH USB\n\n是否立即更新？`
+      : `当前版本：${current}\n\n是否立即更新？\n· 从 npm 官方源下载新版本及其依赖（首次约 250MB）\n· 更新期间界面保持可用，完成后重启应用生效\n· 失败会自动保留当前版本`,
     buttons: ['立即更新', '跳过此版本', '稍后'],
     defaultId: 0,
     cancelId: 2,
@@ -549,8 +714,32 @@ async function runUpdateFlow(manual) {
   if (response === 2) return;
 
   updateBusy = true;
-  const progressWin = showUpdateWindow(latest);
+  const progressWin = showUpdateWindow(latest, hostInstall ? 'host' : 'agent');
   try {
+    if (hostInstall) {
+      const cmdPath = updater.applyUpdateViaHost(ctx, latest, process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath));
+      const { response: r2 } = await showBox({
+        type: 'info',
+        title: '已调度宿主机更新',
+        message: `即将更新到 @deepseek-ai/dsh@${latest}`,
+        detail: '应用将退出，由宿主机安装脚本完成下载与替换，随后自动重新启动。\n日志：' + cmdPath,
+        buttons: ['立即退出并更新', '取消'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (r2 !== 0) {
+        try { fs.rmSync(cmdPath, { force: true }); } catch {}
+        updateBusy = false;
+        if (progressWin && !progressWin.isDestroyed()) progressWin.destroy();
+        return;
+      }
+      quitting = true;
+      forceQuit = true;
+      killTree(serverProc);
+      if (sessionWatcher) sessionWatcher.stop();
+      setTimeout(() => app.exit(0), 300);
+      return;
+    }
     await updater.applyUpdate(ctx, latest);
     const { response: r2 } = await showBox({
       type: 'info',
@@ -630,10 +819,9 @@ function setCloseToTray(v) {
 }
 
 function repoUrls() {
-  const repos = clientUpdater.resolveRepos();
   return {
-    github: 'https://github.com/' + repos.github,
-    gitee: 'https://gitee.com/' + repos.gitee,
+    github: 'https://github.com/yuloong07-star/dsh-usb',
+    gitee: 'https://gitee.com/yuloong07-star/dsh-usb',
   };
 }
 
@@ -643,7 +831,7 @@ async function showAbout() {
     type: 'info',
     title: '关于 DSH USB',
     message: 'DSH USB',
-    detail: 'DeepSeek Harness 桌面客户端\n\nagent 版本：' + dshVersion() + '（' + dshVersionSource() + '）\n数据目录：' + userDataDir + '\nDSH_HOME：' + (dshHome || '（dsh 默认）') +
+    detail: 'DeepSeek Harness 桌面客户端\n\nagent 版本：' + dshVersion() + '（' + dshVersionSource() + '）\n模块模式：' + (proxyModules ? 'proxy（exFAT 兼容）' : 'symlink') + '\n数据目录：' + userDataDir + '\nDSH_HOME：' + (dshHome || '（dsh 默认）') +
       '\n\n项目仓库：\n  GitHub: ' + urls.github + '\n  Gitee:  ' + urls.gitee,
     buttons: ['复制 GitHub 地址', '复制 Gitee 地址', '确定'],
   });
@@ -697,7 +885,6 @@ function registerChromeIpc() {
       case 'open-browser': if (webUrl) shell.openExternal(webUrl); break;
       case 'open-logs': shell.openPath(logsDir); break;
       case 'check-agent-update': runUpdateFlow(true); break;
-      case 'check-client-update': runClientUpdateFlow(true); break;
       case 'toggle-notify': {
         notifyOnTurnEnd = !notifyOnTurnEnd;
         const s = updater.loadSettings(updCtx());
@@ -1023,160 +1210,6 @@ function warnTempRun() {
 }
 
 // ---------------------------------------------------------------------------
-// 客户端自更新流程（更新 DSH USB 封装本身）
-// ---------------------------------------------------------------------------
-
-async function runClientUpdateFlow(manual) {
-  if (quitting) return;
-  if (clientUpdateBusy) {
-    if (manual) await showBox({ type: 'info', title: '更新', message: '客户端更新正在进行中，请稍候。', buttons: ['确定'] });
-    return;
-  }
-  const ctx = updCtx();
-  const settings = updater.loadSettings(ctx);
-  let release;
-  try {
-    release = await clientUpdater.checkLatest(ctx, APP_VERSION);
-  } catch (err) {
-    log('client-update', '检查失败: ' + err.message);
-    if (manual) {
-      await showBox({
-        type: 'warning',
-        title: '检查客户端更新失败',
-        message: '无法连接上游发布源。',
-        detail: err.message + '\n\n可通过环境变量 DSH_DESKTOP_RELEASE_API 指定镜像 API。',
-        buttons: ['确定'],
-      });
-    }
-    return;
-  }
-  if (!release.isNewer) {
-    if (manual) {
-      await showBox({
-        type: 'info',
-        title: '检查客户端更新',
-        message: '当前已是最新版本。',
-        detail: `DSH USB v${APP_VERSION}\n上游最新：${release.version}（${release.source}）`,
-        buttons: ['确定'],
-      });
-    }
-    return;
-  }
-  if (!manual && settings.skipClientVersion === release.version) return;
-  // M7 修复：用户选过"稍后"的同版本不再每 12h 重复弹窗/重复下载。
-  if (!manual && settings.pendingClientVersion === release.version) return;
-  const notes = release.body ? '\n\n更新说明：\n' + release.body.slice(0, 800) : '';
-  const { response } = await showBox({
-    type: 'info',
-    title: '发现新版本客户端',
-    message: `DSH USB 发布了新版本：v${release.version}`,
-    detail: `当前版本：v${APP_VERSION}\n发布来源：${release.source}${notes}\n\n是否立即更新？下载后自动替换并重启应用。`,
-    buttons: ['立即更新', '跳过此版本', '稍后'],
-    defaultId: 0,
-    cancelId: 2,
-  });
-  if (response === 1) {
-    settings.skipClientVersion = release.version;
-    updater.saveSettings(ctx, settings);
-    log('client-update', '用户跳过版本 ' + release.version);
-    return;
-  }
-  if (response === 2) {
-    // M7 修复：记录"稍后"版本，周期检查不再重复打扰（新版本出现时仍会提示）。
-    settings.pendingClientVersion = release.version;
-    updater.saveSettings(ctx, settings);
-    log('client-update', '用户稍后处理版本 ' + release.version);
-    return;
-  }
-
-  clientUpdateBusy = true;
-  const progressWin = showUpdateWindow(release.version, 'client');
-  try {
-    const { filePath, size } = await clientUpdater.downloadRelease(ctx, release, {
-      onProgress: (received, total) => {
-        const pct = total > 0 ? Math.round((received * 100) / total) : -1;
-        if (progressWin && !progressWin.isDestroyed()) {
-          progressWin.webContents
-            .executeJavaScript(
-              `window.__setProgress && window.__setProgress(${pct}, ${Math.round(received / 1048576)}, ${Math.round(total / 1048576)})`
-            )
-            .catch(() => {});
-        }
-      },
-    });
-    settings.pendingClientUpdate = { version: release.version, path: filePath, source: release.source };
-    settings.skipClientVersion = null;
-    settings.pendingClientVersion = null;
-    updater.saveSettings(ctx, settings);
-    const { response: r2 } = await showBox({
-      type: 'info',
-      title: '下载完成',
-      message: `已准备好 DSH USB v${release.version}（${Math.round(size / 1048576)} MB）。`,
-      detail: '立即重启应用完成更新？\n· 重启后自动安装新版本并启动\n· 选择稍后重启：下次启动时再提示安装',
-      buttons: ['立即重启', '稍后重启'],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (r2 === 0) {
-      quitting = true;
-      forceQuit = true;
-      killTree(serverProc);
-      updater.abort();
-      if (sessionWatcher) sessionWatcher.stop();
-      clientUpdater.applyUpdate(ctx, settings.pendingClientUpdate);
-      setTimeout(() => app.exit(0), 400);
-    }
-  } catch (err) {
-    log('client-update', '更新失败: ' + err.message);
-    await showBox({
-      type: 'error',
-      title: '更新失败',
-      message: '未能完成客户端更新，仍使用当前版本。',
-      detail: err.message,
-      buttons: ['确定'],
-    });
-  } finally {
-    clientUpdateBusy = false;
-    if (progressWin && !progressWin.isDestroyed()) progressWin.destroy();
-  }
-}
-
-function offerPendingClientUpdate() {
-  const ctx = updCtx();
-  const settings = updater.loadSettings(ctx);
-  const pending = settings.pendingClientUpdate;
-  if (!pending || !pending.path) return;
-  if (!fs.existsSync(pending.path)) {
-    settings.pendingClientUpdate = null;
-    updater.saveSettings(ctx, settings);
-    return;
-  }
-  if (updater.compareVersions(pending.version, APP_VERSION) <= 0) {
-    settings.pendingClientUpdate = null;
-    updater.saveSettings(ctx, settings);
-    return;
-  }
-  showBox({
-    type: 'info',
-    title: '有待安装的客户端更新',
-    message: `已下载 DSH USB v${pending.version}，是否现在安装并重启？`,
-    detail: '安装包保存在数据目录的 updates 文件夹中。',
-    buttons: ['立即重启', '稍后'],
-    defaultId: 0,
-    cancelId: 1,
-  }).then(({ response }) => {
-    if (response !== 0) return;
-    quitting = true;
-    forceQuit = true;
-    killTree(serverProc);
-    updater.abort();
-    if (sessionWatcher) sessionWatcher.stop();
-    clientUpdater.applyUpdate(ctx, pending);
-    setTimeout(() => app.exit(0), 400);
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -1255,16 +1288,21 @@ function startPreviewStaticServer() {
 
 function scheduleCacheCleanup() {
   try {
-    const dirs = ['Cache', 'Code Cache', 'GPUCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'blob_storage', 'logs', 'Network'];
-    const ps1Path = path.join(os.tmpdir(), 'dsh-usb-cleanup.ps1');
+    // Script lives on the USB userData dir so quitting never leaves files in %TEMP%.
+    const dirs = ['Cache', 'Code Cache', 'GPUCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'blob_storage', 'logs', 'Network', 'temp'];
+    const scriptDir = path.join(userDataDir, 'logs');
+    fs.mkdirSync(scriptDir, { recursive: true });
+    const ps1Path = path.join(scriptDir, 'dsh-usb-cleanup.ps1');
     const body = [
       "$target = " + JSON.stringify(userDataDir),
+      "$me = $MyInvocation.MyCommand.Path",
       "$deadline = (Get-Date).AddSeconds(60)",
       "while ((Get-Date) -lt $deadline -and (Get-Process -Name 'DSH USB' -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 500 }",
       "foreach ($d in @(" + dirs.map((d) => JSON.stringify(d)).join(',') + ")) {",
       "  Remove-Item -LiteralPath (Join-Path $target $d) -Recurse -Force -ErrorAction SilentlyContinue",
       "}",
-      "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue",
+      // A running .ps1 cannot delete itself on Windows; hand off to cmd.
+      "Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','ping -n 3 127.0.0.1 >nul & del /f /q \"' + $me + '\"' -WindowStyle Hidden",
     ].join('\r\n');
     fs.writeFileSync(ps1Path, body, 'utf8');
     const sysRoot = process.env.SystemRoot || 'C:\\Windows';
@@ -1278,29 +1316,47 @@ function scheduleCacheCleanup() {
     log('quit', 'schedule cache cleanup failed: ' + err.message);
   }
 }
+// Migrate helpers live at module top (before setPath); boot() re-runs idempotently.
+
 function boot() {
   // Portable builds keep all data next to the exe.
   if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
     app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
   } else {
-    // DSH USB build: keep ALL runtime data in a local "dsh" folder next to
+    // DSH USB build: keep ALL runtime data in a local "dshusb" folder next to
     // the exe so nothing is written to %APPDATA% and the USB drive stays
     // fully self-contained.
     const exeDir = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(process.execPath);
-    app.setPath('userData', path.join(exeDir, 'dsh'));
+    migrateLegacyLayout(exeDir);
+    app.setPath('userData', path.join(exeDir, 'dshusb'));
   }
 
   userDataDir = app.getPath('userData');
   logsDir = path.join(userDataDir, 'logs');
-  // DSH_HOME: respect an explicit override; otherwise let dsh use its own
-  // default (~/.dsh), so the desktop app shares config/sessions with the CLI.
-  // DSH USB build: default DSH_HOME to a local folder inside "dsh" so agent
+  // DSH_HOME: respect an explicit override; otherwise use local .dsh so agent
   // sessions/config live on the USB drive instead of ~/.dsh.
-  dshHome = process.env.DSH_HOME || path.join(userDataDir, 'dsh-home');
+  dshHome = process.env.DSH_HOME || path.join(userDataDir, '.dsh');
   fs.mkdirSync(logsDir, { recursive: true });
   if (dshHome) fs.mkdirSync(dshHome, { recursive: true });
   desktopLog = fs.createWriteStream(path.join(logsDir, 'desktop.log'), { flags: 'a' });
   log('boot', `DSH USB ${APP_VERSION}  userData=${userDataDir}  dshHome=${dshHome || '(dsh 默认)'}  agent=${dshVersion()}(${dshVersionSource()})`);
+
+  try { updater.cleanupTemp(updCtx()); } catch (err) { log('boot', '启动清扫失败: ' + err.message); }
+
+  try {
+    proxyModules = !detectJunctionSupport(userDataDir);
+    if (proxyModules) {
+      process.env.DSH_USB_PROXY_MODULES = '1';
+      const n = sanitizeProfileModulesForProxy(dshHome);
+      log('boot', `junction 不可用，启用 ESM proxy 模块（清理残留 ${n} 项）；dsh 启动时将自动 heal`);
+    } else {
+      log('boot', 'junction 可用，使用 symlink 模块链接');
+    }
+  } catch (err) {
+    log('boot', 'junction 探测失败，按 proxy 模式处理: ' + err.message);
+    proxyModules = true;
+    process.env.DSH_USB_PROXY_MODULES = '1';
+  }
 
   // 移除原生菜单栏（文件/视图/帮助），全部功能由自绘 chrome 与托盘提供。
   Menu.setApplicationMenu(null);
@@ -1315,7 +1371,7 @@ function boot() {
       // effective DSH_HOME (same config the CLI uses).
       const s = updater.loadSettings(updCtx());
       notifyOnTurnEnd = s.notifyOnTurnEnd !== false;
-      const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+      const home = dshHome || path.join(os.homedir(), '.dsh');
       sessionWatcher = new SessionWatcher({
         sessionsDir: path.join(home, 'sessions'),
         log,
@@ -1324,10 +1380,8 @@ function boot() {
       sessionWatcher.start();
       // maintainShortcuts(); // DSH USB: never create desktop/start-menu shortcuts on first run
       warnTempRun();
-      offerPendingClientUpdate();
 
-      // [patched] agent auto-update disabled
-      // [patched] client auto-update disabled
+      // [patched] agent auto-update disabled (manual menu only)
     })
     .catch((err) => handleBootFailure(err));
 }

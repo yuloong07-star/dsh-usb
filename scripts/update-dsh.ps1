@@ -29,9 +29,17 @@ if (-not $DshRoot) {
 
 
 # ----- 路径配置 -----------------------------------------------------------
-$DshDataDir   = Join-Path $DshRoot "dsh"
-$AgentDir     = Join-Path $DshDataDir "agent"
-$StagingDir   = Join-Path $DshDataDir "agent-staging"
+$DshDataDir   = Join-Path $DshRoot "dshusb"
+if (-not (Test-Path $DshDataDir)) {
+    $legacyData = Join-Path $DshRoot "dsh"
+    if (Test-Path $legacyData) { $DshDataDir = $legacyData }
+}
+$AgentDir     = Join-Path $DshDataDir "deepseek-ai"
+if (-not (Test-Path $AgentDir)) {
+    $legacyAgent = Join-Path $DshDataDir "agent"
+    if (Test-Path $legacyAgent) { $AgentDir = $legacyAgent }
+}
+$StagingDir   = Join-Path $DshDataDir "deepseek-ai-staging"
 $HostTempBase = "C:\dsh-temp-install"
 $HostTempDir  = Join-Path $HostTempBase ("dsh-update-" + (Get-Date -Format "yyyyMMddHHmmss"))
 $NodeExe      = Join-Path $DshRoot "resources\node\node.exe"
@@ -40,7 +48,11 @@ $AppBootFile  = Join-Path $StagingDir "node_modules\@deepseek-ai\dsh-app-boot\li
 $SettingsFile = Join-Path $DshDataDir "settings.json"
 $LogDir       = Join-Path $DshDataDir "logs"
 $LogFile      = Join-Path $LogDir "update.log"
-$DshHome      = Join-Path $DshDataDir "dsh-home"
+$DshHome      = Join-Path $DshDataDir ".dsh"
+if (-not (Test-Path $DshHome)) {
+    $legacyHome = Join-Path $DshDataDir "dsh-home"
+    if (Test-Path $legacyHome) { $DshHome = $legacyHome }
+}
 $McpPatchFile = Join-Path $DshHome "profiles\web\node_modules\dsh-computer-use-win\cordis.patch.yml"
 
 # ----- 颜色输出辅助 -------------------------------------------------------
@@ -207,7 +219,13 @@ function Cleanup-Host {
         Write-Log "已删除宿主机临时目录: $HostTempDir"
     }
 
-    $oldBackups = Get-ChildItem -Path $DshDataDir -Directory -Filter "agent-old-*" -ErrorAction SilentlyContinue
+    # 基目录若已空则一并删掉，避免 C:\dsh-temp-install 长期空壳残留
+    if ((Test-Path $HostTempBase) -and -not (Get-ChildItem -Path $HostTempBase -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -Path $HostTempBase -Force -ErrorAction SilentlyContinue
+        Write-Log "已删除空的宿主机临时基目录: $HostTempBase"
+    }
+
+    $oldBackups = Get-ChildItem -Path $DshDataDir -Directory -Filter "deepseek-ai-old-*" -ErrorAction SilentlyContinue
     foreach ($bak in $oldBackups) {
         Remove-Item -Path $bak.FullName -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "已清理旧备份: $($bak.Name)"
@@ -343,14 +361,16 @@ function Atomic-Swap {
     if (-not (Test-Path $StagingDir)) { throw "staging 目录不存在: $StagingDir" }
 
     if (Test-Path $AgentDir) {
-        $backupDir = Join-Path $DshDataDir ("agent-old-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        $backupDir = Join-Path $DshDataDir ("deepseek-ai-old-" + (Get-Date -Format "yyyyMMddHHmmss"))
         Write-Log "备份旧 overlay → $backupDir"
         Rename-Item -Path $AgentDir -NewName (Split-Path $backupDir -Leaf) -Force
     }
 
-    Write-Log "交换: $StagingDir → $AgentDir"
-    Rename-Item -Path $StagingDir -NewName "agent" -Force
+    Write-Log "交换: $StagingDir → deepseek-ai"
+    Rename-Item -Path $StagingDir -NewName "deepseek-ai" -Force
 
+    # 交换后 overlay 一定是新命名；写回脚本作用域供后续步骤使用
+    $script:AgentDir = Join-Path $DshDataDir "deepseek-ai"
     if (Test-Path $AgentDir) {
         $agentPkg = Join-Path $AgentDir "node_modules\@deepseek-ai\dsh\package.json"
         if (Test-Path $agentPkg) {
@@ -360,7 +380,7 @@ function Atomic-Swap {
             Write-Ok "交换成功（版本信息未知）"
         }
     } else {
-        throw "交换失败"
+        throw "交换失败：$AgentDir 不存在"
     }
 
     $settings = @{}
@@ -466,7 +486,7 @@ function Stop-DshForUpdate {
     })
     if ($roots.Count -eq 0 -and $nodeBefore.Count -eq 0) { return $true }
     if (-not $Yes) {
-        Write-Warn "检测到 DSH USB 正在运行。更新前需要关闭它（不影响 dsh-home 数据）。"
+        Write-Warn "检测到 DSH USB 正在运行。更新前需要关闭它（不影响 .dsh 数据）。"
         $answer = Read-Host "输入 y 继续，其他键取消"
         if ($answer -notmatch '^[yY]$') {
             Write-Warn "已取消更新"
@@ -580,10 +600,70 @@ if (error.code === "EEXIST" && lstatSync(link).isSymbolicLink() && symlinkPoints
         $needRewrite = $true
     }
 
+    if (-not $c.Contains('DSH_USB_PROXY_MODULES')) {
+        $oldPkg = "function isPackagedExecutable() {`n`treturn process.pkg !== void 0;`n}"
+        $newPkg = @'
+function isPackagedExecutable() {
+	// DSH USB: exFAT/FAT32 cannot create junctions; force ESM proxy packages.
+	return process.pkg !== void 0 || process.env.DSH_USB_PROXY_MODULES === "1";
+}
+'@
+        if ($c.Contains($oldPkg)) {
+            $c = $c.Replace($oldPkg, $newPkg.Replace("`r`n", "`n"))
+            $needRewrite = $true
+        } elseif ($c -match 'function\s+isPackagedExecutable\s*\(\s*\)\s*\{[^}]*process\.pkg[^}]*\}') {
+            $c = [regex]::Replace($c, 'function\s+isPackagedExecutable\s*\(\s*\)\s*\{[^}]*process\.pkg[^}]*\}', $newPkg.Replace("`r`n", "`n"))
+            $needRewrite = $true
+        } else {
+            throw "dsh-app-boot isPackagedExecutable 锚点未找到，无法打 proxy-mode 补丁"
+        }
+    }
+
+    if (-not $c.Contains('binary-only package')) {
+        $oldProxy = @'
+})) : [...links].flatMap(([packageName, packageDir]) => {
+			const source = packageProxySource(packageName, packageDir);
+			return Object.keys(source.targets).length === 0 ? [] : [{
+				kind: "proxy",
+				packageName,
+				version: source.version,
+				targets: source.targets
+			}];
+		}),
+'@
+        $newProxy = @'
+})) : [...links].flatMap(([packageName, packageDir]) => {
+			// DSH USB: binary-only package has no JS entry — use symlink/copy instead of proxy.
+			let source;
+			try {
+				source = packageProxySource(packageName, packageDir);
+			} catch {
+				return [{ kind: "symlink", packageName, packageDir }];
+			}
+			return Object.keys(source.targets).length === 0 ? [] : [{
+				kind: "proxy",
+				packageName,
+				version: source.version,
+				targets: source.targets
+			}];
+		}),
+'@
+        $oldProxyN = $oldProxy.Replace("`r`n", "`n")
+        $newProxyN = $newProxy.Replace("`r`n", "`n")
+        if ($c.Contains($oldProxyN)) {
+            $c = $c.Replace($oldProxyN, $newProxyN)
+            $needRewrite = $true
+        } else {
+            throw "dsh-app-boot resolveModuleFallbackEntries proxy 分支锚点未找到，无法打 binary-fallback 补丁"
+        }
+    }
+
     $patched = $c.Contains('function dshCopyCurrent') -and
                $c.Contains('optionalDependencies') -and
                $c.Contains('.dsh-copy-ok') -and
-               $c.Contains('cpSync')
+               $c.Contains('cpSync') -and
+               $c.Contains('DSH_USB_PROXY_MODULES') -and
+               $c.Contains('binary-only package')
     if (-not $patched) {
         throw "exFAT/可选依赖补丁校验失败（代码格式可能已变化）: $File"
     }
@@ -621,6 +701,22 @@ function Set-McpPathCompatibility {
     Write-Ok "MCP 路径补丁已应用"
 }
 
+function Test-JunctionSupport {
+    param([string]$Dir)
+    $target = Join-Path $Dir ".dsh-junction-target"
+    $probe  = Join-Path $Dir ".dsh-junction-probe"
+    try {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        New-Item -ItemType Junction -Path $probe -Target $target -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-ProfileHeal {
     $agentPkg = Join-Path $AgentDir "node_modules\$PackageName\package.json"
     if (-not (Test-Path -LiteralPath $agentPkg)) {
@@ -639,12 +735,23 @@ await healProfilesModuleFallback({ installAnchor: '$agentPkgPath', home: '$homeP
         Write-Warn "[DryRun] 跳过 profiles 回退副本刷新"
         return
     }
-    Write-Step "离线刷新 profiles 回退副本（首次约 1-2 分钟）"
-    & $NodeExe --input-type=module -e $script
-    if ($LASTEXITCODE -ne 0) {
-        throw "profiles 回退副本刷新失败（退出码 $LASTEXITCODE）"
+    Write-Step "离线刷新 profiles 模块链接/proxy（首次约 1-2 分钟）"
+    $useProxy = -not (Test-JunctionSupport -Dir $DshDataDir)
+    if ($useProxy) {
+        Write-Log "junction 不可用，heal 使用 ESM proxy 模式"
+        $env:DSH_USB_PROXY_MODULES = '1'
+    } else {
+        Remove-Item Env:DSH_USB_PROXY_MODULES -ErrorAction SilentlyContinue
     }
-    Write-Ok "profiles 回退副本已刷新"
+    try {
+        & $NodeExe --input-type=module -e $script
+        if ($LASTEXITCODE -ne 0) {
+            throw "profiles 刷新失败（退出码 $LASTEXITCODE）"
+        }
+    } finally {
+        Remove-Item Env:DSH_USB_PROXY_MODULES -ErrorAction SilentlyContinue
+    }
+    Write-Ok "profiles 模块链接/proxy 已刷新"
 }
 
 # ===== 主流程 ==============================================================
@@ -692,7 +799,7 @@ function Main {
         }
 
         if ($DryRun) {
-            Write-Warn "[DryRun] 仅演练：将安装 $target 到 C 盘临时目录并交换到 agent"
+            Write-Warn "[DryRun] 仅演练：将安装 $target 到 C 盘临时目录并交换到 deepseek-ai"
             exit 0
         }
 
