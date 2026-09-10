@@ -200,7 +200,8 @@ function bootPatchMarkersPresent(content) {
     content.includes('optionalDependencies') &&
     content.includes('.dsh-copy-ok') &&
     content.includes('cpSync') &&
-    content.includes('DSH_USB_PROXY_MODULES')
+    content.includes('DSH_USB_PROXY_MODULES') &&
+    content.includes('binary-only package')
   );
 }
 
@@ -233,6 +234,54 @@ function applyProxyModePatch(ctx, content, steps) {
   return r.text;
 }
 
+// Binary-only packages (e.g. @vscode/ripgrep-win32-x64) have no JS entry, so
+// packageProxySource throws and crashed proxy-mode heal. Fall those packages
+// back to symlink/copy (ensureSymlink already handles exFAT copy fallback).
+function applyProxyBinaryFallbackPatch(ctx, content, steps) {
+  if (content.includes('binary-only package')) {
+    steps.push({ name: 'proxy-binary-fallback', status: 'already' });
+    return content;
+  }
+  const oldBlock =
+    '})) : [...links].flatMap(([packageName, packageDir]) => {\n' +
+    '\t\t\tconst source = packageProxySource(packageName, packageDir);\n' +
+    '\t\t\treturn Object.keys(source.targets).length === 0 ? [] : [{\n' +
+    '\t\t\t\tkind: "proxy",\n' +
+    '\t\t\t\tpackageName,\n' +
+    '\t\t\t\tversion: source.version,\n' +
+    '\t\t\t\ttargets: source.targets\n' +
+    '\t\t\t}];\n' +
+    '\t\t}),';
+  const newBlock =
+    '})) : [...links].flatMap(([packageName, packageDir]) => {\n' +
+    '\t\t\t// DSH USB: binary-only package has no JS entry — use symlink/copy instead of proxy.\n' +
+    '\t\t\tlet source;\n' +
+    '\t\t\ttry {\n' +
+    '\t\t\t\tsource = packageProxySource(packageName, packageDir);\n' +
+    '\t\t\t} catch {\n' +
+    '\t\t\t\treturn [{ kind: "symlink", packageName, packageDir }];\n' +
+    '\t\t\t}\n' +
+    '\t\t\treturn Object.keys(source.targets).length === 0 ? [] : [{\n' +
+    '\t\t\t\tkind: "proxy",\n' +
+    '\t\t\t\tpackageName,\n' +
+    '\t\t\t\tversion: source.version,\n' +
+    '\t\t\t\ttargets: source.targets\n' +
+    '\t\t\t}];\n' +
+    '\t\t}),';
+  const r = replaceFirst(content, [oldBlock], newBlock);
+  if (!r.hit) {
+    const loose = content.match(/\}\)\) : \[\.\.\.links\]\.flatMap\(\(\[packageName, packageDir\]\) => \{\n\s*const source = packageProxySource\(packageName, packageDir\);\n\s*return Object\.keys\(source\.targets\)\.length === 0 \? \[\] : \[\{\n\s*kind: "proxy",\n\s*packageName,\n\s*version: source\.version,\n\s*targets: source\.targets\n\s*\}\];\n\s*\}\),/);
+    if (!loose) {
+      throw new Error('exFAT 补丁步骤 proxy-binary-fallback 失败：resolveModuleFallbackEntries proxy 分支锚点未找到');
+    }
+    content = content.replace(loose[0], newBlock);
+    steps.push({ name: 'proxy-binary-fallback', status: 'applied', via: 'loose' });
+    return content;
+  }
+  steps.push({ name: 'proxy-binary-fallback', status: 'applied' });
+  return r.text;
+}
+
 function patchBootForExfat(ctx, bootFile) {
   if (!fs.existsSync(bootFile)) {
     throw new Error('安装后未找到 dsh-app-boot: ' + bootFile);
@@ -247,7 +296,7 @@ function patchBootForExfat(ctx, bootFile) {
     return { changed: false, steps };
   }
 
-  // Older patches may lack proxy-mode only — apply that step alone when possible.
+  // Older patches may lack proxy-mode / binary-fallback only — apply those steps alone.
   if (
     content.includes('function dshCopyCurrent') &&
     content.includes('optionalDependencies') &&
@@ -255,6 +304,7 @@ function patchBootForExfat(ctx, bootFile) {
     content.includes('cpSync')
   ) {
     content = applyProxyModePatch(ctx, content, steps);
+    content = applyProxyBinaryFallbackPatch(ctx, content, steps);
     if (bootPatchMarkersPresent(content) && content !== normalizeEol(original)) {
       fs.writeFileSync(bootFile, content, 'utf8');
       const nodeBin0 = ctx.nodeExe && ctx.nodeExe();
@@ -262,13 +312,15 @@ function patchBootForExfat(ctx, bootFile) {
       const chk0 = spawnSync(checker0, ['--check', bootFile], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
       if (chk0.status !== 0) {
         try { fs.writeFileSync(bootFile, original, 'utf8'); } catch {}
-        throw new Error('proxy-mode 补丁语法校验失败，已回滚: ' + (chk0.stderr || chk0.stdout || '').slice(-300));
+        throw new Error('proxy 补丁语法校验失败，已回滚: ' + (chk0.stderr || chk0.stdout || '').slice(-300));
       }
-      ctx.log('update', '已补齐 proxy-mode 补丁: ' + bootFile);
+      ctx.log('update', '已补齐 proxy-mode/binary-fallback 补丁: ' + bootFile +
+        ' steps=' + steps.map((s) => s.name + ':' + s.status).join(','));
       return { changed: true, steps };
     }
     if (bootPatchMarkersPresent(content)) return { changed: false, steps };
-    throw new Error('exFAT 补丁 proxy-mode 补齐失败: ' + bootFile);
+    throw new Error('exFAT 补丁 proxy 步骤补齐失败: ' + bootFile +
+      ' steps=' + steps.map((s) => s.name + ':' + s.status).join(','));
   }
 
   // 1) extend fs import with cpSync/renameSync (tolerate either already present)
@@ -443,6 +495,7 @@ function patchBootForExfat(ctx, bootFile) {
   }
 
   content = applyProxyModePatch(ctx, content, steps);
+  content = applyProxyBinaryFallbackPatch(ctx, content, steps);
 
   if (!bootPatchMarkersPresent(content)) {
     throw new Error('exFAT/可选依赖补丁校验失败（标记不完整）: ' + bootFile +

@@ -619,11 +619,51 @@ function isPackagedExecutable() {
         }
     }
 
+    if (-not $c.Contains('binary-only package')) {
+        $oldProxy = @'
+})) : [...links].flatMap(([packageName, packageDir]) => {
+			const source = packageProxySource(packageName, packageDir);
+			return Object.keys(source.targets).length === 0 ? [] : [{
+				kind: "proxy",
+				packageName,
+				version: source.version,
+				targets: source.targets
+			}];
+		}),
+'@
+        $newProxy = @'
+})) : [...links].flatMap(([packageName, packageDir]) => {
+			// DSH USB: binary-only package has no JS entry — use symlink/copy instead of proxy.
+			let source;
+			try {
+				source = packageProxySource(packageName, packageDir);
+			} catch {
+				return [{ kind: "symlink", packageName, packageDir }];
+			}
+			return Object.keys(source.targets).length === 0 ? [] : [{
+				kind: "proxy",
+				packageName,
+				version: source.version,
+				targets: source.targets
+			}];
+		}),
+'@
+        $oldProxyN = $oldProxy.Replace("`r`n", "`n")
+        $newProxyN = $newProxy.Replace("`r`n", "`n")
+        if ($c.Contains($oldProxyN)) {
+            $c = $c.Replace($oldProxyN, $newProxyN)
+            $needRewrite = $true
+        } else {
+            throw "dsh-app-boot resolveModuleFallbackEntries proxy 分支锚点未找到，无法打 binary-fallback 补丁"
+        }
+    }
+
     $patched = $c.Contains('function dshCopyCurrent') -and
                $c.Contains('optionalDependencies') -and
                $c.Contains('.dsh-copy-ok') -and
                $c.Contains('cpSync') -and
-               $c.Contains('DSH_USB_PROXY_MODULES')
+               $c.Contains('DSH_USB_PROXY_MODULES') -and
+               $c.Contains('binary-only package')
     if (-not $patched) {
         throw "exFAT/可选依赖补丁校验失败（代码格式可能已变化）: $File"
     }
